@@ -1,9 +1,9 @@
 # ✈️ Envoy Rainmaker Flight Time Converter
 
-**A 1-click automatic flight log converter for Envoy Air pilots on Mac.**  
+**A 1-click automatic flight log converter for Envoy Air pilots.**  
 Convert your monthly Envoy Rainmaker schedule PDFs into a single file ready to upload into **LogTen Pro**.
 
-No coding or Terminal commands required!
+Works on both **Mac** and **Windows PC** with zero coding or Terminal commands required!
 
 ---
 
@@ -12,7 +12,7 @@ No coding or Terminal commands required!
 ### Step 1: Download & Unzip
 1. Click the green **Code** button at the top of this GitHub page.
 2. Click **Download ZIP**.
-3. Double-click the downloaded ZIP file to open the folder.
+3. Unzip the downloaded folder on your computer.
 
 ---
 
@@ -23,13 +23,18 @@ No coding or Terminal commands required!
 
 ---
 
-### Step 3: Double-click `go.command`
-Double-click the file named **`go.command`**.
+### Step 3: Double-Click to Run
+
+- 🍎 **If using a Mac:**  
+  Double-click **`go.command`**
+
+- 🪟 **If using a Windows PC:**  
+  Double-click **`go.bat`**
 
 That's it! It automatically sets up everything and converts your files in seconds.
 
 > [!NOTE]
-> **First time opening on your Mac?**  
+> **First time opening on Mac?**  
 > If Mac displays a security message saying *"go.command cannot be opened because it is from an unidentified developer"*:
 > 1. Right-click (or Control-click) **`go.command`**.
 > 2. Click **Open** from the pop-up menu.
@@ -59,11 +64,11 @@ Your flights, flight numbers, aircraft type, actual Zulu departure/arrival times
 
 ## ❓ Frequently Asked Questions
 
-#### **Q: Do I need to use Terminal or type commands?**
-No! Just double-click `go.command` and everything runs automatically.
+#### **Q: Does this work on both Windows PC and Mac?**
+Yes! Mac users double-click `go.command`, and Windows PC users double-click `go.bat`.
 
 #### **Q: What if I add more monthly PDFs later?**
-Just drop the new PDF files into the `new` folder and double-click `go.command` again. It will add the new flights to your master logbook file without creating duplicates.
+Just drop the new PDF files into the `new` folder and double-click `go.command` (Mac) or `go.bat` (Windows) again. It will add the new flights to your master logbook file without creating duplicates.
 
 ---
 
