@@ -1,39 +1,48 @@
 # ✈️ Envoy Rainmaker Flight Time Converter
 
-**A 1-click automatic flight log extractor for Envoy Air pilots.**  
+**A 1-click automatic flight log converter for Envoy Air pilots.**  
 Convert your monthly Envoy Rainmaker schedule PDFs into a single file ready to upload into **LogTen Pro**.
 
-
-No coding required!
+No coding or Terminal commands required!
 
 ---
 
 ## 🚀 Easy 3-Step Guide
 
-### Step 1: Put your monthly PDFs in the `new` folder
-- Copy your monthly schedule PDF files into the **`new`** folder inside this project.
-- *Tip:* Make sure the file names include the month and year (for example: `2024-11.pdf` or `Nov_2024.pdf`).
+### Step 1: Download & Unzip
+1. Click the green **Code** button at the top of this GitHub page.
+2. Click **Download ZIP**.
+3. Double-click the downloaded ZIP file to open the folder.
 
 ---
 
-### Step 2: Double-click `go.command`
-1. Double-click the file named **`go.command`**.
-2. A black Terminal window will open and automatically do all the work!
+### Step 2: Put your PDFs in the `new` folder
+1. Open the project folder.
+2. Copy your monthly schedule PDF files into the **`new`** folder.
+   *(Tip: Make sure the file names include the month and year, like `2024-11.pdf` or `Nov_2024.pdf`).*
+
+---
+
+### Step 3: Double-click `go.command`
+Double-click the file named **`go.command`**.
+
+That's it! It automatically installs everything and converts your files in seconds.
 
 > [!NOTE]
-> **First time opening on Mac?**  
+> **First time opening on a Mac?**  
 > If Mac displays a security message saying *"go.command cannot be opened because it is from an unidentified developer"*:
 > 1. Right-click (or Control-click) **`go.command`**.
-> 2. Click **Open** from the menu.
+> 2. Click **Open** from the pop-up menu.
 > 3. Click **Open** again when prompted.
 
 ---
 
-### Step 3: Get your final LogTen Pro file
-When the window finishes, your completed logbook file will be waiting in the **`logten pro format`** folder:
+## 📄 Your Completed File
+
+When finished, your completed logbook spreadsheet will be waiting in the **`logten pro format`** folder:
 - **`logten_pro_import.csv`**
 
-Your original PDFs will automatically be moved to the **`scraped`** folder for safekeeping!
+*(Your original PDFs will automatically be moved to the **`scraped`** folder for safekeeping).*
 
 ---
 
@@ -50,11 +59,11 @@ Your flights, flight numbers, aircraft type, actual Zulu departure/arrival times
 
 ## ❓ Frequently Asked Questions
 
-#### **Q: Do I need to install Python or code anything?**
-No! When you double-click `go.command`, it automatically sets up everything needed in the background.
+#### **Q: Do I need to use Terminal or type commands?**
+No! Just double-click `go.command` and everything runs automatically.
 
 #### **Q: What if I add more monthly PDFs later?**
-Just put the new PDF files in the `new` folder and double-click `go.command` again. It will add the new flights to your master logbook file without creating duplicates.
+Just drop the new PDF files into the `new` folder and double-click `go.command` again. It will add the new flights to your master logbook file without creating duplicates.
 
 ---
 
