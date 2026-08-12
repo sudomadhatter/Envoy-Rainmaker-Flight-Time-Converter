@@ -1,0 +1,27 @@
+# Python virtual environment
+venv/
+ENV/
+env/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Output flight logs & personal PDFs (uncomment if you want to exclude personal PDFs)
+# new/*.pdf
+# scraped/*.pdf
+# logten pro format/*.csv
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo

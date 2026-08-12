@@ -1,0 +1,10 @@
+# Core dependencies
+pandas>=2.0.0
+pdfplumber>=0.10.0
+pypdfium2>=5.0.0
+
+# macOS Native Apple Vision OCR support (Mac OS X only)
+pyobjc-core>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'
