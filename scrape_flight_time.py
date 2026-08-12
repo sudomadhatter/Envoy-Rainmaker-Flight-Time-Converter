@@ -83,7 +83,8 @@ def run_vision_ocr_on_pdf_page(pdf_path, page_idx=0):
     page = pdf[page_idx]
     image = page.render(scale=3).to_pil()
     
-    temp_img_path = f"/tmp/ocr_page_{page_idx}.png"
+    import tempfile
+    temp_img_path = os.path.join(tempfile.gettempdir(), f"ocr_page_{page_idx}.png")
     image.save(temp_img_path)
 
     file_url = NSURL.fileURLWithPath_(temp_img_path)

@@ -1,6 +1,6 @@
 # ✈️ Envoy Rainmaker Flight Time Converter
 
-**A 1-click automatic flight log converter for Envoy Air pilots.**  
+**A 1-click automatic flight log converter for Envoy Air pilots on Mac.**  
 Convert your monthly Envoy Rainmaker schedule PDFs into a single file ready to upload into **LogTen Pro**.
 
 No coding or Terminal commands required!
@@ -26,10 +26,10 @@ No coding or Terminal commands required!
 ### Step 3: Double-click `go.command`
 Double-click the file named **`go.command`**.
 
-That's it! It automatically installs everything and converts your files in seconds.
+That's it! It automatically sets up everything and converts your files in seconds.
 
 > [!NOTE]
-> **First time opening on a Mac?**  
+> **First time opening on your Mac?**  
 > If Mac displays a security message saying *"go.command cannot be opened because it is from an unidentified developer"*:
 > 1. Right-click (or Control-click) **`go.command`**.
 > 2. Click **Open** from the pop-up menu.
@@ -46,14 +46,14 @@ When finished, your completed logbook spreadsheet will be waiting in the **`logt
 
 ---
 
-## 📲 How to Upload to LogTen Pro (Mac)
+## 📲 How to Upload to LogTen Pro (Mac / iPad / iPhone)
 
 1. Open **LogTen Pro** on your Mac.
 2. At the top menu bar, click **File** $\rightarrow$ **Import from File** $\rightarrow$ **Flights...**
 3. Select **`logten_pro_import.csv`** from your `logten pro format` folder.
 4. Click **Import**.
 
-Your flights, flight numbers, aircraft type, actual Zulu departure/arrival times, and PIC/SIC hours will automatically sync to your iPhone and iPad via iCloud!
+Your flights, flight numbers, aircraft type, actual Zulu departure/arrival times, and PIC/SIC hours will automatically sync across all your devices via iCloud!
 
 ---
 
