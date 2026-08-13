@@ -16,7 +16,9 @@ __pycache__/
 
 # Personal files & processed storage
 scraped_stored/
+scraped_stored/*
 scratch/
+scratch/*
 
 # OS metadata
 .DS_Store
