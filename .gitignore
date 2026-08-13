@@ -9,14 +9,15 @@ __pycache__/
 *$py.class
 *.so
 
-# Output flight logs & personal PDFs (uncomment if you want to exclude personal PDFs)
-# new/*.pdf
-# scraped/*.pdf
-# logten pro format/*.csv
-
-# Personal files & processed storage
+# Input, output & personal PDF/CSV storage directories
+new/
+new/*
+scraped/
+scraped/*
 scraped_stored/
 scraped_stored/*
+logten pro format/
+logten pro format/*
 scratch/
 scratch/*
 
