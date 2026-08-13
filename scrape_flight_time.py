@@ -3,7 +3,7 @@
 Envoy Rainmaker Flight Time Converter
 --------------------------------------
 Scrapes pilot monthly Envoy Rainmaker flight schedule PDFs, extracts actual flight details,
-decodes crew roles and times, and exports to a CSV format ready for LogTen Pro import.
+decodes crew roles and times, traps month overflow/underflow, and exports to a CSV format ready for LogTen Pro import.
 Supports both digital PDFs and scanned/image-based PDFs via macOS Vision OCR.
 """
 
@@ -12,8 +12,9 @@ import re
 import glob
 import sys
 import shutil
+import calendar
 import argparse
-from datetime import datetime
+import tempfile
 import pandas as pd
 
 # PDF text layer libraries
@@ -37,10 +38,63 @@ except ImportError:
     HAS_VISION_OCR = False
 
 
+class MonthDateTracker:
+    """
+    Traps month boundaries (overflow & underflow) when processing pilot monthly schedule days.
+    
+    - Underflow: Document starts with day >= 25 from previous month (e.g. Sept schedule starting Aug 31).
+    - In-month: Day numbers belong to base month.
+    - Overflow: Day resets from >= 25 to <= 7 near end of document (e.g. sequence crossing Nov 30 -> Dec 1).
+    """
+    def __init__(self, base_year, base_month):
+        self.base_year = base_year
+        self.base_month = base_month
+        self.state = None  # "BEFORE", "IN", "AFTER"
+        self.last_day = None
+
+    def update_day(self, day):
+        if not (1 <= day <= 31):
+            return
+
+        if self.last_day is None:
+            if day >= 25:
+                self.state = "BEFORE"
+            else:
+                self.state = "IN"
+        else:
+            if self.state == "BEFORE":
+                if day <= 15:
+                    self.state = "IN"
+            elif self.state == "IN":
+                if self.last_day >= 25 and day <= 7:
+                    self.state = "AFTER"
+
+        self.last_day = day
+
+    def get_current_date_str(self):
+        if self.last_day is None:
+            return f"{self.base_year:04d}-{self.base_month:02d}-01"
+
+        day = self.last_day
+        if self.state == "BEFORE":
+            m = self.base_month - 1 if self.base_month > 1 else 12
+            y = self.base_year if self.base_month > 1 else self.base_year - 1
+        elif self.state == "AFTER":
+            m = self.base_month + 1 if self.base_month < 12 else 1
+            y = self.base_year if self.base_month < 12 else self.base_year + 1
+        else:
+            m = self.base_month
+            y = self.base_year
+
+        max_days = calendar.monthrange(y, m)[1]
+        valid_day = min(day, max_days)
+        return f"{y:04d}-{m:02d}-{valid_day:02d}"
+
+
 def parse_month_year_from_filename(filename):
     """
     Extracts year and month from filenames such as:
-    '2024-11.pdf', 'Nov_2024.pdf', '2024_11_schedule.pdf', '11-2024.pdf'
+    'April 2025.pdf', '2024-11.pdf', 'Nov_2024.pdf', '2024_11_schedule.pdf'
     """
     basename = os.path.basename(filename)
     
@@ -54,7 +108,7 @@ def parse_month_year_from_filename(filename):
     if match:
         return int(match.group(2)), int(match.group(1))
 
-    # Check for Month Name + Year (e.g. Nov_2024 or 2024_Nov)
+    # Check for Month Name + Year (e.g. Nov_2024 or April 2025)
     months = {
         'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
@@ -68,22 +122,21 @@ def parse_month_year_from_filename(filename):
             if year_match:
                 return int(year_match.group(1)), month_num
 
-    # Default fallback for testing if no month/year in UUID filename
-    return 2024, 11
+    return 2025, 1
 
 
-def run_vision_ocr_on_pdf_page(pdf_path, page_idx=0):
+def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     """
-    Renders PDF page to image and runs macOS Vision OCR to return spatially ordered lines.
+    Renders PDF page to image, runs macOS Vision OCR, and returns lines composed of spatial token objects.
+    Each token contains: 'text', 'x' (0..1), 'y' (0..1), 'w', 'h'.
     """
     if not HAS_VISION_OCR or not pypdfium2:
-        return ""
+        return []
 
     pdf = pypdfium2.PdfDocument(pdf_path)
     page = pdf[page_idx]
     image = page.render(scale=3).to_pil()
     
-    import tempfile
     temp_img_path = os.path.join(tempfile.gettempdir(), f"ocr_page_{page_idx}.png")
     image.save(temp_img_path)
 
@@ -106,16 +159,20 @@ def run_vision_ocr_on_pdf_page(pdf_path, page_idx=0):
             'h': bbox.size.height
         })
 
-    # Cluster text observations into horizontal lines
+    if os.path.exists(temp_img_path):
+        os.remove(temp_img_path)
+
+    obs_list.sort(key=lambda i: i['y'])
+
     current_y = None
     lines = []
     current_line = []
 
-    for item in sorted(obs_list, key=lambda i: i['y']):
+    for item in obs_list:
         if current_y is None or abs(item['y'] - current_y) > 0.012:
             if current_line:
                 current_line.sort(key=lambda i: i['x'])
-                lines.append(' '.join([i['text'] for i in current_line]))
+                lines.append(current_line)
             current_line = [item]
             current_y = item['y']
         else:
@@ -124,102 +181,94 @@ def run_vision_ocr_on_pdf_page(pdf_path, page_idx=0):
 
     if current_line:
         current_line.sort(key=lambda i: i['x'])
-        lines.append(' '.join([i['text'] for i in current_line]))
+        lines.append(current_line)
 
-    if os.path.exists(temp_img_path):
-        os.remove(temp_img_path)
-
-    return '\n'.join(lines)
+    return lines
 
 
-def extract_pdf_lines(pdf_path):
+def extract_pdf_token_lines(pdf_path):
     """
-    Attempts text extraction via pdfplumber first. If empty, runs macOS Vision OCR.
+    Extracts text tokens with spatial coordinates. Falls back to pdfplumber lines if Vision OCR unavailable.
     """
-    text_content = ""
+    if HAS_VISION_OCR:
+        return run_vision_ocr_token_lines(pdf_path)
+    
+    # Fallback to pdfplumber text line strings wrapped as mock token lists
+    token_lines = []
     if pdfplumber:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 extracted = page.extract_text() or ""
-                if extracted.strip():
-                    text_content += extracted + "\n"
-
-    if not text_content.strip() and HAS_VISION_OCR:
-        print("  -> Digital text layer empty; running macOS Vision OCR...")
-        text_content = run_vision_ocr_on_pdf_page(pdf_path)
-
-    return text_content
+                for line in extracted.splitlines():
+                    if line.strip():
+                        token_lines.append([{'text': line.strip(), 'x': 0.05, 'y': 0.5}])
+    return token_lines
 
 
-def parse_schedule_text(text, year=2024, month=11):
+def parse_schedule_token_lines(token_lines, year=2025, month=1):
     """
-    Parses schedule text lines into flight leg dictionaries.
+    Parses spatial token lines into flight leg dictionaries with month trapping.
     """
     records = []
-    lines = text.splitlines()
-    current_day = None
+    tracker = MonthDateTracker(year, month)
 
-    day_header_pattern = re.compile(r'^\s*(?P<day>\d{1,2})\s+[S|O]')
+    non_airports = {
+        'LEG', 'DHX', 'DHD', 'DD', 'SI', 'RF', 'R1', 'R2', 'TRNG', 'POS', 'STD', 'STA',
+        'ATD', 'ATA', 'EQP', 'FLT', 'SEQ', 'DUTY', 'E75', 'E70', 'E145', 'E175', 'ORG',
+        'DST', 'DHO', 'PREM', 'PAID', 'RPT', 'BASE', 'UNPAID', 'SCHED', 'ACTFLT',
+        'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL'
+    }
 
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
+    for line_tokens in token_lines:
+        if not line_tokens:
             continue
 
-        # Day tracking (e.g., "21 S ...")
-        day_match = day_header_pattern.match(line_str)
-        if day_match:
-            current_day = int(day_match.group("day"))
+        line_str = " ".join([t['text'] for t in line_tokens])
 
-        # Look for flight legs (e.g. "RF 3554 0 E75 ... MIA CVG FO 15:01 17:44 21:09 23:39 ...")
-        # Match flight numbers (3-5 digits), origin/dest airports (3 caps excluding keywords)
-        non_airports = {'DHD', 'DD', 'SI', 'RF', 'R1', 'R2', 'TRNG', 'POS', 'STD', 'STA', 'ATD', 'ATA', 'EQP', 'FLT', 'SEQ', 'DUTY', 'E75', 'E70', 'E145'}
-        
-        # Find 3-letter uppercase sequences
+        # Day tracking: check if first token on far left (x < 0.16) is a day number 1..31
+        first_token = line_tokens[0]
+        if first_token['x'] < 0.16:
+            m_day = re.match(r'^(?P<day>[0-3]?\d)\b(?!\s*:)', first_token['text'])
+            if m_day:
+                day_val = int(m_day.group("day"))
+                if 1 <= day_val <= 31:
+                    tracker.update_day(day_val)
+
+        # Look for flight legs
         three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
         airports = [w for w in three_letter_words if w not in non_airports]
-
         flt_match = re.search(r'\b(\d{3,4})\b', line_str)
-        
-        # Check if line contains a flight leg (has flight number and at least 2 valid airport codes)
-        if len(airports) >= 2 and flt_match and current_day:
+
+        if len(airports) >= 2 and flt_match and tracker.last_day is not None:
             flt_num = flt_match.group(1)
             org = airports[0]
             dst = airports[1]
 
-
-            # Extract aircraft type (e.g. E75, E175, B738, A320)
-            eqp_match = re.search(r'\b(E75|E175|E145|CRJ\d|B73\d|A32\d)\b', line_str)
+            eqp_match = re.search(r'\b(E75|E175|E145|E70|CRJ\d|B73\d|A32\d)\b', line_str)
             eqp = eqp_match.group(1) if eqp_match else "E75"
 
-            # Extract Position (FO / CA)
             pos_match = re.search(r'\b(FO|CA|CP)\b', line_str)
             pos = pos_match.group(1).upper() if pos_match else "FO"
 
-            # Extract times (HH:MM patterns)
             times = re.findall(r'\b(\d{2}:\d{2})\b', line_str)
-            
-            # Times in layout: [STD, STA, ATD, ATA, SkdDur, ActDur, Time]
-            # Standard order when available:
             std = times[0] if len(times) > 0 else ""
             sta = times[1] if len(times) > 1 else ""
             atd = times[2] if len(times) > 2 else std
             ata = times[3] if len(times) > 3 else sta
-            
-            # Duration logic
+
             act_dur = ""
             if len(times) >= 6:
-                act_dur = times[5]  # ActDur
+                act_dur = times[5]
             elif len(times) >= 5:
-                act_dur = times[4]  # SkdDur / Dur
+                act_dur = times[4]
             elif len(times) >= 1:
                 act_dur = times[-1]
             else:
                 act_dur = "00:00"
 
-            is_deadhead = (" D " in f" {line_str} " or "DHD" in line_str) and "TRNG" not in line_str
+            is_deadhead = (" D " in f" {line_str} " or "DHD" in line_str or "DHX" in line_str) and "TRNG" not in line_str
 
-            date_str = f"{year:04d}-{month:02d}-{current_day:02d}"
+            date_str = tracker.get_current_date_str()
 
             pic_time = ""
             sic_time = ""
@@ -236,7 +285,7 @@ def parse_schedule_text(text, year=2024, month=11):
                 "Date": date_str,
                 "Flight": flt_num,
                 "Aircraft Type": eqp,
-                "Registration": eqp,  # Tail registration / equipment
+                "Registration": eqp,
                 "From": org,
                 "To": dst,
                 "Out": atd,
@@ -254,37 +303,42 @@ def parse_schedule_text(text, year=2024, month=11):
 
 def process_pdf_file(pdf_path):
     year, month = parse_month_year_from_filename(pdf_path)
-    text_content = extract_pdf_lines(pdf_path)
-    return parse_schedule_text(text_content, year=year, month=month)
+    token_lines = extract_pdf_token_lines(pdf_path)
+    return parse_schedule_token_lines(token_lines, year=year, month=month)
 
 
 def main():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    default_input = os.path.join(base_dir, "new")
+    default_output = os.path.join(base_dir, "logten pro format", "logten_pro_import.csv")
+    default_archive = os.path.join(base_dir, "scraped")
+
     parser = argparse.ArgumentParser(description="Scrape pilot flight time PDFs into LogTen Pro CSV format.")
-    parser.add_argument("--input", "-i", default="/Users/sudohatter/Jons_flight_time/new", help="Directory containing PDF files or path to single PDF.")
-    parser.add_argument("--output", "-o", default="/Users/sudohatter/Jons_flight_time/logten pro format/logten_pro_import.csv", help="Output CSV file path.")
-    parser.add_argument("--archive", "-a", default="/Users/sudohatter/Jons_flight_time/scraped", help="Directory to move processed PDFs to.")
-    
+    parser.add_argument("--input", "-i", default=default_input, help="Directory containing PDF files or path to single PDF.")
+    parser.add_argument("--output", "-o", default=default_output, help="Output CSV file path.")
+    parser.add_argument("--archive", "-a", default=default_archive, help="Directory to move processed PDFs to.")
+
     args = parser.parse_args()
-    
+
     pdf_files = []
     if os.path.isfile(args.input):
         pdf_files = [args.input]
     elif os.path.isdir(args.input):
         pdf_files = glob.glob(os.path.join(args.input, "*.pdf")) + glob.glob(os.path.join(args.input, "*.PDF"))
-    
+
     if not pdf_files:
         print(f"No PDF files found in '{args.input}'.")
         sys.exit(0)
 
     print(f"Found {len(pdf_files)} PDF file(s) to process in '{args.input}'.")
-    
+
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     if args.archive:
         os.makedirs(args.archive, exist_ok=True)
 
     all_flights = []
     processed_files = []
-    
+
     for pdf in sorted(pdf_files):
         filename = os.path.basename(pdf)
         print(f"Processing '{filename}'...")
@@ -292,7 +346,7 @@ def main():
         all_flights.extend(flights)
         processed_files.append(pdf)
         print(f"  -> Extracted {len(flights)} flight record(s).")
-        
+
     if all_flights:
         df_new = pd.DataFrame(all_flights)
         columns_order = [
@@ -302,7 +356,7 @@ def main():
         for col in columns_order:
             if col not in df_new.columns:
                 df_new[col] = ""
-                
+
         df_new = df_new[columns_order]
 
         if os.path.exists(args.output):
