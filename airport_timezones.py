@@ -76,6 +76,7 @@ AIRPORT_TZ = {
     )},
     # Atlantic / Caribbean with DST
     "PLS": "America/Grand_Turk",
+    "XSC": "America/Grand_Turk",
     "PAP": "America/Port-au-Prince",
     "BDA": "Atlantic/Bermuda",
     # Caribbean / Central & South America (UTC-5 year-round, no DST)
