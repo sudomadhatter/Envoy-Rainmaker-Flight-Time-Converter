@@ -18,31 +18,18 @@ Built to run inside **Claude Code** (or **Antigravity**, **VS Code**, **Cursor**
 
 ---
 
-## Brand New to Coding AI Tools? Start Here (3-Minute Claude Code Setup)
+## Brand New to Coding AI Tools? Start Here (3-Minute Setup — No Terminal Required)
 
-If you have never used a coding LLM or Git before, the easiest way to run this converter is **Claude Code** (requires a Claude Pro, Max, Team, or Console account):
+If you have never used a coding LLM or Git before, you can run this entire converter from the **Claude Desktop** app (requires a Claude Pro, Max, Team, or Console account):
 
-### Option A — Claude Desktop App (No Terminal Required)
 1. Download and install the **Claude Desktop** app for **Mac** or **Windows**: [https://claude.ai/download](https://claude.ai/download)
 2. Open the app, sign in, and click the **Code** tab in the left sidebar.
 3. Paste this single message into the chat:
 
 > **"Clone https://github.com/sudomadhatter/Envoy-Rainmaker-Flight-Time-Converter.git into my Documents folder, set it up using AGENTS.md, and show me the `new` folder where I drop my Rainmaker PDFs."**
 
-Claude will download the repo, check/install Python, set up the virtual environment automatically, and tell you the exact folder to drop your PDFs into. Whenever you drop PDFs into `new/`, just type **`"go"`**.
-
-### Option B — Claude Code in Terminal (or VS Code)
-1. Install Claude Code with one command:
-   - **Mac:** Press `Cmd + Space`, type **Terminal**, press Enter, and paste:
-     ```bash
-     curl -fsSL https://claude.ai/install.sh | bash
-     ```
-   - **Windows:** Open the Start menu, type **PowerShell**, press Enter, and paste:
-     ```powershell
-     irm https://claude.ai/install.ps1 | iex
-     ```
-2. **Close and reopen** Terminal / PowerShell, then type `claude` and follow the browser sign-in prompt (or install the official **Claude Code** extension inside [VS Code](https://code.visualstudio.com/)).
-3. Follow the **Quick Start** below.
+4. In Envoy Rainmaker (**Crew Pay Details**), click **`More → Details`** so all flying days are expanded, print/save as PDF, drop your PDFs into that **`new/`** folder, and type **`"go"`** in Claude.
+5. Open **LogTen Pro** (`File → Import from File → Flights...`) and select **`logten pro format/logten_pro_import.csv`**.
 
 ---
 
