@@ -31,3 +31,8 @@ if not exist "logten pro format" mkdir "logten pro format"
 
 echo.
 echo [SUCCESS] Windows setup complete!
+echo --------------------------------------------------------
+echo To process flight time PDFs:
+echo 1. Place your monthly PDF files in the 'new' folder.
+echo 2. Run: run.bat
+echo --------------------------------------------------------

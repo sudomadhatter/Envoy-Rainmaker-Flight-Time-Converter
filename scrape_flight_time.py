@@ -9,9 +9,9 @@ Supports both digital PDFs and scanned/image-based PDFs via macOS Vision OCR.
 
 import os
 import re
-import glob
 import sys
 import shutil
+import logging
 import calendar
 import argparse
 import tempfile
@@ -20,6 +20,7 @@ import pandas as pd
 # PDF text layer libraries
 try:
     import pdfplumber
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
 except ImportError:
     pdfplumber = None
 
@@ -125,6 +126,43 @@ def parse_month_year_from_filename(filename):
     return 2025, 1
 
 
+DEADHEAD_PATTERN = re.compile(
+    r'(?:'
+    r'DHD[-_/\\\s]*A[-_/\\\s]*OA[-_]?DHD'
+    r'|OA[-_]?DHD'
+    r'|DHD[-_/\\]?A\b'
+    r'|\bDHD\b'
+    r'|\bDHX\b'
+    r'|(?<=\s)D(?=\s)'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def is_deadhead_line(line_str):
+    """Return True if a schedule line represents a deadhead leg (not flight time)."""
+    return bool(DEADHEAD_PATTERN.search(f" {line_str} "))
+
+
+def find_pdf_files(input_path):
+    """Return sorted, deduplicated PDF paths from a single file or directory."""
+    if os.path.isfile(input_path):
+        return [input_path]
+    if not os.path.isdir(input_path):
+        return []
+
+    seen = set()
+    pdf_files = []
+    for entry in sorted(os.listdir(input_path)):
+        if entry.lower().endswith(".pdf"):
+            full_path = os.path.join(input_path, entry)
+            norm = os.path.normcase(os.path.abspath(full_path))
+            if os.path.isfile(full_path) and norm not in seen:
+                seen.add(norm)
+                pdf_files.append(full_path)
+    return pdf_files
+
+
 def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     """
     Renders PDF page to image, runs macOS Vision OCR, and returns lines composed of spatial token objects.
@@ -136,31 +174,33 @@ def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     pdf = pypdfium2.PdfDocument(pdf_path)
     page = pdf[page_idx]
     image = page.render(scale=3).to_pil()
-    
-    temp_img_path = os.path.join(tempfile.gettempdir(), f"ocr_page_{page_idx}.png")
-    image.save(temp_img_path)
 
-    file_url = NSURL.fileURLWithPath_(temp_img_path)
-    request_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(file_url, None)
+    tmp_fd, temp_img_path = tempfile.mkstemp(prefix=f"ocr_page_{page_idx}_", suffix=".png")
+    os.close(tmp_fd)
+    try:
+        image.save(temp_img_path)
 
-    request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    request_handler.performRequests_error_([request], None)
+        file_url = NSURL.fileURLWithPath_(temp_img_path)
+        request_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(file_url, None)
 
-    obs_list = []
-    for obs in request.results():
-        bbox = obs.boundingBox()
-        text = obs.topCandidates_(1)[0].string()
-        obs_list.append({
-            'text': text,
-            'x': bbox.origin.x,
-            'y': 1.0 - bbox.origin.y,  # Convert to top-down Y
-            'w': bbox.size.width,
-            'h': bbox.size.height
-        })
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        request_handler.performRequests_error_([request], None)
 
-    if os.path.exists(temp_img_path):
-        os.remove(temp_img_path)
+        obs_list = []
+        for obs in (request.results() or []):
+            bbox = obs.boundingBox()
+            text = obs.topCandidates_(1)[0].string()
+            obs_list.append({
+                'text': text,
+                'x': bbox.origin.x,
+                'y': 1.0 - bbox.origin.y,  # Convert to top-down Y
+                'w': bbox.size.width,
+                'h': bbox.size.height
+            })
+    finally:
+        if os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
 
     obs_list.sort(key=lambda i: i['y'])
 
@@ -186,37 +226,74 @@ def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     return lines
 
 
-def extract_pdf_token_lines(pdf_path):
+def parse_month_year_from_tokens(token_lines):
     """
-    Extracts text tokens with spatial coordinates. Falls back to pdfplumber lines if Vision OCR unavailable.
+    Extracts (year, month) from Rainmaker PDF headers such as 'Period: 202611' or 'Period:202608'.
+    Returns None if no Period header is present.
     """
-    if HAS_VISION_OCR:
-        return run_vision_ocr_token_lines(pdf_path)
-    
-    # Fallback to pdfplumber text line strings wrapped as mock token lists
+    for line_tokens in token_lines[:40]:
+        line_str = " ".join(t['text'] for t in line_tokens)
+        match = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def extract_pdfplumber_token_lines(pdf_path):
+    """Extract text lines via pdfplumber for digital PDFs."""
     token_lines = []
-    if pdfplumber:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text() or ""
-                for line in extracted.splitlines():
-                    if line.strip():
-                        token_lines.append([{'text': line.strip(), 'x': 0.05, 'y': 0.5}])
+    if not pdfplumber:
+        return token_lines
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_text() or ""
+            for line in extracted.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    token_lines.append([{'text': stripped, 'x': 0.05, 'y': 0.5}])
     return token_lines
 
 
-def parse_schedule_token_lines(token_lines, year=2025, month=1):
+def extract_pdf_token_lines(pdf_path):
     """
-    Parses spatial token lines into flight leg dictionaries with month trapping.
+    Extracts text lines across all pages.
+    Uses pdfplumber first for digital PDFs, falling back to multi-page macOS Vision OCR
+    when no embedded text layer is present (scanned/image PDFs).
+    """
+    token_lines = extract_pdfplumber_token_lines(pdf_path)
+    if token_lines:
+        return token_lines
+
+    if HAS_VISION_OCR and pypdfium2:
+        pdf = pypdfium2.PdfDocument(pdf_path)
+        all_lines = []
+        for page_idx in range(len(pdf)):
+            all_lines.extend(run_vision_ocr_token_lines(pdf_path, page_idx=page_idx))
+        return all_lines
+
+    return []
+
+
+def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, include_scheduled=False):
+    """
+    Parses spatial token lines into operating flight leg dictionaries with month trapping.
+    Deadhead legs (e.g. DHD-A\\OA_DHD, DHD,OA_DHD, DHD, DHX, standalone D) are excluded
+    from flight time. Future unflown scheduled legs (missing ATD/ATA/ActDur) are skipped
+    unless include_scheduled=True.
+    Returns (records, skipped_deadheads, skipped_unflown).
     """
     records = []
+    skipped_deadheads = 0
+    skipped_unflown = 0
     tracker = MonthDateTracker(year, month)
 
     non_airports = {
         'LEG', 'DHX', 'DHD', 'DD', 'SI', 'RF', 'R1', 'R2', 'TRNG', 'POS', 'STD', 'STA',
         'ATD', 'ATA', 'EQP', 'FLT', 'SEQ', 'DUTY', 'E75', 'E70', 'E145', 'E175', 'ORG',
         'DST', 'DHO', 'PREM', 'PAID', 'RPT', 'BASE', 'UNPAID', 'SCHED', 'ACTFLT',
-        'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL'
+        'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL', 'USD', 'PDM', 'SRC',
+        'UTC', 'RSV', 'ADD', 'PAY', 'RESV', 'REGL'
     }
 
     for line_tokens in token_lines:
@@ -225,19 +302,31 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1):
 
         line_str = " ".join([t['text'] for t in line_tokens])
 
-        # Day tracking: check if first token on far left (x < 0.16) is a day number 1..31
+        # Skip browser print headers and footer URLs so timestamps like 11/19/26 never corrupt day tracking
+        if (
+            re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}\b', line_str)
+            or line_str.startswith(("http://", "https://"))
+            or "Rainmaker - CrewPayDetails" in line_str
+        ):
+            continue
+
+        # Day tracking: check if first token on far left (x < 0.16) starts with a standalone day number 1..31
         first_token = line_tokens[0]
         if first_token['x'] < 0.16:
-            m_day = re.match(r'^(?P<day>[0-3]?\d)\b(?!\s*:)', first_token['text'])
+            m_day = re.match(r'^(?P<day>[0-3]?\d)(?!\s*[:/\.\-])(?:\s|$)', first_token['text'])
             if m_day:
                 day_val = int(m_day.group("day"))
                 if 1 <= day_val <= 31:
                     tracker.update_day(day_val)
 
-        # Look for flight legs
+        flt_match = re.search(r'\b(\d{3,4})\b', line_str)
+        if flt_match and tracker.last_day is not None and is_deadhead_line(line_str):
+            skipped_deadheads += 1
+            continue
+
+        # Look for operating flight legs
         three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
         airports = [w for w in three_letter_words if w not in non_airports]
-        flt_match = re.search(r'\b(\d{3,4})\b', line_str)
 
         if len(airports) >= 2 and flt_match and tracker.last_day is not None:
             flt_num = flt_match.group(1)
@@ -250,36 +339,26 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1):
             pos_match = re.search(r'\b(FO|CA|CP)\b', line_str)
             pos = pos_match.group(1).upper() if pos_match else "FO"
 
-            times = re.findall(r'\b(\d{2}:\d{2})\b', line_str)
-            std = times[0] if len(times) > 0 else ""
-            sta = times[1] if len(times) > 1 else ""
-            atd = times[2] if len(times) > 2 else std
-            ata = times[3] if len(times) > 3 else sta
-
-            act_dur = ""
-            if len(times) >= 6:
-                act_dur = times[5]
-            elif len(times) >= 5:
-                act_dur = times[4]
-            elif len(times) >= 1:
-                act_dur = times[-1]
+            # No \b required so concatenated Rainmaker times like 07:4909:1407:4609:03 extract cleanly
+            times = re.findall(r'(\d{2}:\d{2})', line_str)
+            if len(times) < 6:
+                if not include_scheduled:
+                    skipped_unflown += 1
+                    continue
+                std = times[0] if len(times) > 0 else ""
+                sta = times[1] if len(times) > 1 else ""
+                atd = std
+                ata = sta
+                act_dur = times[2] if len(times) > 2 else "00:00"
             else:
-                act_dur = "00:00"
-
-            is_deadhead = (" D " in f" {line_str} " or "DHD" in line_str or "DHX" in line_str) and "TRNG" not in line_str
+                atd = times[2]
+                ata = times[3]
+                act_dur = times[5]
 
             date_str = tracker.get_current_date_str()
 
-            pic_time = ""
-            sic_time = ""
-            dhd_time = ""
-
-            if is_deadhead:
-                dhd_time = act_dur
-            elif pos in ("CA", "CP"):
-                pic_time = act_dur
-            else:
-                sic_time = act_dur
+            pic_time = act_dur if pos in ("CA", "CP") else ""
+            sic_time = "" if pos in ("CA", "CP") else act_dur
 
             record = {
                 "Date": date_str,
@@ -290,21 +369,42 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1):
                 "To": dst,
                 "Out": atd,
                 "In": ata,
-                "Total Time": act_dur if not is_deadhead else "00:00",
+                "Total Time": act_dur,
                 "PIC": pic_time,
                 "SIC": sic_time,
-                "Deadhead": dhd_time,
+                "Deadhead": "",
                 "Remarks": f"Position: {pos}, Out: {atd}Z, In: {ata}Z"
             }
             records.append(record)
 
+    return records, skipped_deadheads, skipped_unflown
+
+
+def parse_schedule_token_lines(token_lines, year=2025, month=1, include_scheduled=False):
+    """
+    Parses spatial token lines into operating flight leg dictionaries with month trapping.
+    """
+    records, _, _ = parse_schedule_token_lines_with_stats(
+        token_lines, year=year, month=month, include_scheduled=include_scheduled
+    )
     return records
 
 
-def process_pdf_file(pdf_path):
-    year, month = parse_month_year_from_filename(pdf_path)
+def process_pdf_file_with_stats(pdf_path, include_scheduled=False):
     token_lines = extract_pdf_token_lines(pdf_path)
-    return parse_schedule_token_lines(token_lines, year=year, month=month)
+    header_ym = parse_month_year_from_tokens(token_lines)
+    if header_ym is not None:
+        year, month = header_ym
+    else:
+        year, month = parse_month_year_from_filename(pdf_path)
+    return parse_schedule_token_lines_with_stats(
+        token_lines, year=year, month=month, include_scheduled=include_scheduled
+    )
+
+
+def process_pdf_file(pdf_path, include_scheduled=False):
+    records, _, _ = process_pdf_file_with_stats(pdf_path, include_scheduled=include_scheduled)
+    return records
 
 
 def main():
@@ -316,15 +416,12 @@ def main():
     parser = argparse.ArgumentParser(description="Scrape pilot flight time PDFs into LogTen Pro CSV format.")
     parser.add_argument("--input", "-i", default=default_input, help="Directory containing PDF files or path to single PDF.")
     parser.add_argument("--output", "-o", default=default_output, help="Output CSV file path.")
-    parser.add_argument("--archive", "-a", default=default_archive, help="Directory to move processed PDFs to.")
+    parser.add_argument("--archive", "-a", default=default_archive, help="Directory to move processed PDFs to (empty string to keep originals in place).")
+    parser.add_argument("--include-scheduled", action="store_true", help="Include future scheduled legs that do not yet have actual block times.")
 
     args = parser.parse_args()
 
-    pdf_files = []
-    if os.path.isfile(args.input):
-        pdf_files = [args.input]
-    elif os.path.isdir(args.input):
-        pdf_files = glob.glob(os.path.join(args.input, "*.pdf")) + glob.glob(os.path.join(args.input, "*.PDF"))
+    pdf_files = find_pdf_files(args.input)
 
     if not pdf_files:
         print(f"No PDF files found in '{args.input}'.")
@@ -332,20 +429,33 @@ def main():
 
     print(f"Found {len(pdf_files)} PDF file(s) to process in '{args.input}'.")
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     if args.archive:
         os.makedirs(args.archive, exist_ok=True)
 
     all_flights = []
+    total_skipped_deadheads = 0
+    total_skipped_unflown = 0
     processed_files = []
 
-    for pdf in sorted(pdf_files):
+    for pdf in pdf_files:
         filename = os.path.basename(pdf)
         print(f"Processing '{filename}'...")
-        flights = process_pdf_file(pdf)
+        flights, skipped_deadheads, skipped_unflown = process_pdf_file_with_stats(
+            pdf, include_scheduled=args.include_scheduled
+        )
         all_flights.extend(flights)
+        total_skipped_deadheads += skipped_deadheads
+        total_skipped_unflown += skipped_unflown
         processed_files.append(pdf)
-        print(f"  -> Extracted {len(flights)} flight record(s).")
+
+        notes = []
+        if skipped_deadheads:
+            notes.append(f"skipped {skipped_deadheads} deadhead leg(s)")
+        if skipped_unflown:
+            notes.append(f"skipped {skipped_unflown} unflown scheduled leg(s)")
+        note_str = f" ({', '.join(notes)})" if notes else ""
+        print(f"  -> Extracted {len(flights)} flight record(s){note_str}.")
 
     if all_flights:
         df_new = pd.DataFrame(all_flights)
@@ -368,8 +478,16 @@ def main():
         else:
             df_combined = df_new
 
+        df_combined = df_combined.sort_values(by=["Date", "Out", "Flight"], kind="stable")
         df_combined.to_csv(args.output, index=False)
-        print(f"\nSuccessfully updated '{args.output}' (Total records: {len(df_combined)}).")
+
+        summary_notes = []
+        if total_skipped_deadheads:
+            summary_notes.append(f"skipped {total_skipped_deadheads} deadhead leg(s)")
+        if total_skipped_unflown:
+            summary_notes.append(f"skipped {total_skipped_unflown} unflown scheduled leg(s)")
+        summary_suffix = f", {', '.join(summary_notes)}" if summary_notes else ""
+        print(f"\nSuccessfully updated '{args.output}' (Total records: {len(df_combined)}{summary_suffix}).")
 
         if args.archive:
             for pdf in processed_files:
