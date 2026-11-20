@@ -15,8 +15,9 @@ This repository converts monthly Envoy Air Rainmaker schedule PDFs into a CSV re
    - **Mac / Linux:** `./run.sh`
    - **Windows:** `run.bat`
 3. Report back to the user:
-   - How many operating flight legs were extracted.
-   - How many deadhead legs (`DHD-A\OA_DHD`, `DHD`, `DHX`, etc.) were skipped (deadheads are excluded so they are never counted as flight time).
+   - How many operating flight legs were extracted (and note if local airport times were auto-converted to UTC).
+   - Any **collapsed-day warnings** printed by the script (tell the user to click `More -> Details` in Rainmaker and re-export if any flying day was left collapsed).
+   - How many deadhead legs (`DHD-A\OA_DHD`, `DHD,OA_DHD`, `DHD`, `DHX`, etc.) and future unflown scheduled legs were skipped.
    - The path to the updated CSV: `logten pro format/logten_pro_import.csv`.
    - That processed PDFs were moved to `scraped/`.
 

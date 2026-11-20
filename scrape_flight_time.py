@@ -17,6 +17,8 @@ import argparse
 import tempfile
 import pandas as pd
 
+from airport_timezones import convert_leg_local_to_utc, hhmm_to_minutes
+
 # PDF text layer libraries
 try:
     import pdfplumber
@@ -275,12 +277,93 @@ def extract_pdf_token_lines(pdf_path):
     return []
 
 
+def detect_collapsed_days(token_lines, year=2025, month=1):
+    """
+    Detect flying day summary rows (e.g. '3 S 6639\\RF E70 05:38 ...') whose leg detail
+    sub-table was left collapsed when the Rainmaker page was printed to PDF.
+    Returns a list of (date_str, base_hhmm) tuples.
+    """
+    tracker = MonthDateTracker(year, month)
+    collapsed = []
+    pending_day = None  # (date_str, base_hhmm, has_details)
+
+    for line_tokens in token_lines:
+        if not line_tokens:
+            continue
+        line_str = " ".join(t['text'] for t in line_tokens)
+
+        if (
+            re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}\b', line_str)
+            or line_str.startswith(("http://", "https://"))
+            or "Rainmaker - CrewPayDetails" in line_str
+        ):
+            continue
+
+        if "Details" in line_str and "Flt" in line_str and "Seq" in line_str:
+            if pending_day is not None:
+                pending_day = (pending_day[0], pending_day[1], True)
+            continue
+
+        first_token = line_tokens[0]
+        if first_token['x'] < 0.16:
+            m_day = re.match(r'^(?P<day>[0-3]?\d)(?!\s*[:/\.\-])(?:\s|$)', first_token['text'])
+            if m_day:
+                day_val = int(m_day.group("day"))
+                if 1 <= day_val <= 31:
+                    if pending_day is not None and not pending_day[2]:
+                        collapsed.append((pending_day[0], pending_day[1]))
+                    pending_day = None
+
+                    tracker.update_day(day_val)
+                    date_str = tracker.get_current_date_str()
+                    has_seq = bool(re.search(r'\b\d{3,6}\\[A-Za-z]+', line_str))
+                    pos_times = re.findall(r'(?<!-)(\b\d{2}:\d{2}\b)', line_str)
+                    nonzero_times = [t for t in pos_times if t != "00:00"]
+                    if has_seq and nonzero_times:
+                        pending_day = (date_str, nonzero_times[0], False)
+
+    if pending_day is not None and not pending_day[2]:
+        collapsed.append((pending_day[0], pending_day[1]))
+
+    return collapsed
+
+
+def detect_pdf_uses_local_time(token_lines, raw_records):
+    """
+    Determine whether the PDF's Out/In times are in airport local time rather than UTC.
+    1. In Rainmaker, when local time is displayed, the toggle button reads 'Show time as UTC'.
+       When UTC is displayed, the toggle button reads 'Show time as Local'.
+    2. If neither header is present, inspect any cross-timezone legs: if converting local->UTC
+       makes (In - Out) match ActDur where raw (In - Out) did not, the PDF is in local time.
+    """
+    for line_tokens in token_lines[:60]:
+        line_str = " ".join(t['text'] for t in line_tokens).lower()
+        if "show time as local" in line_str or "show local time" in line_str:
+            return False
+        if "show time as utc" in line_str:
+            return True
+
+    for rec in raw_records:
+        raw_diff = (hhmm_to_minutes(rec["In"]) - hhmm_to_minutes(rec["Out"])) % 1440
+        act_mins = hhmm_to_minutes(rec["Total Time"])
+        if raw_diff != act_mins:
+            _, utc_out, utc_in = convert_leg_local_to_utc(
+                rec["Date"], rec["From"], rec["To"], rec["Out"], rec["In"], rec["Total Time"]
+            )
+            utc_diff = (hhmm_to_minutes(utc_in) - hhmm_to_minutes(utc_out)) % 1440
+            if utc_diff == act_mins:
+                return True
+
+    return False
+
+
 def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, include_scheduled=False):
     """
     Parses spatial token lines into operating flight leg dictionaries with month trapping.
     Deadhead legs (e.g. DHD-A\\OA_DHD, DHD,OA_DHD, DHD, DHX, standalone D) are excluded
     from flight time. Future unflown scheduled legs (missing ATD/ATA/ActDur) are skipped
-    unless include_scheduled=True.
+    unless include_scheduled=True. Automatically converts local airport Out/In/Date to UTC
+    when Rainmaker was exported without 'Show time as UTC' toggled.
     Returns (records, skipped_deadheads, skipped_unflown).
     """
     records = []
@@ -373,9 +456,28 @@ def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, inclu
                 "PIC": pic_time,
                 "SIC": sic_time,
                 "Deadhead": "",
-                "Remarks": f"Position: {pos}, Out: {atd}Z, In: {ata}Z"
+                "Remarks": f"Position: {pos}, Out: {atd}Z, In: {ata}Z",
+                "_pos": pos,
             }
             records.append(record)
+
+    uses_local = detect_pdf_uses_local_time(token_lines, records)
+    for rec in records:
+        pos = rec.pop("_pos")
+        if uses_local and rec["Out"] and rec["In"] and rec["Total Time"]:
+            local_date = rec["Date"]
+            local_out = rec["Out"]
+            local_in = rec["In"]
+            utc_date, utc_out, utc_in = convert_leg_local_to_utc(
+                local_date, rec["From"], rec["To"], local_out, local_in, rec["Total Time"]
+            )
+            rec["Date"] = utc_date
+            rec["Out"] = utc_out
+            rec["In"] = utc_in
+            rec["Remarks"] = (
+                f"Position: {pos}, Local: {local_date} {local_out}-{local_in}, "
+                f"Out: {utc_out}Z, In: {utc_in}Z"
+            )
 
     return records, skipped_deadheads, skipped_unflown
 
@@ -390,16 +492,26 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1, include_schedule
     return records
 
 
-def process_pdf_file_with_stats(pdf_path, include_scheduled=False):
+def process_pdf_file_with_report(pdf_path, include_scheduled=False):
     token_lines = extract_pdf_token_lines(pdf_path)
     header_ym = parse_month_year_from_tokens(token_lines)
     if header_ym is not None:
         year, month = header_ym
     else:
         year, month = parse_month_year_from_filename(pdf_path)
-    return parse_schedule_token_lines_with_stats(
+    collapsed_days = detect_collapsed_days(token_lines, year=year, month=month)
+    records, skipped_deadheads, skipped_unflown = parse_schedule_token_lines_with_stats(
         token_lines, year=year, month=month, include_scheduled=include_scheduled
     )
+    converted_local_to_utc = any("Local:" in r.get("Remarks", "") for r in records)
+    return records, skipped_deadheads, skipped_unflown, collapsed_days, converted_local_to_utc
+
+
+def process_pdf_file_with_stats(pdf_path, include_scheduled=False):
+    records, skipped_deadheads, skipped_unflown, _, _ = process_pdf_file_with_report(
+        pdf_path, include_scheduled=include_scheduled
+    )
+    return records, skipped_deadheads, skipped_unflown
 
 
 def process_pdf_file(pdf_path, include_scheduled=False):
@@ -441,21 +553,34 @@ def main():
     for pdf in pdf_files:
         filename = os.path.basename(pdf)
         print(f"Processing '{filename}'...")
-        flights, skipped_deadheads, skipped_unflown = process_pdf_file_with_stats(
-            pdf, include_scheduled=args.include_scheduled
-        )
+        (
+            flights,
+            skipped_deadheads,
+            skipped_unflown,
+            collapsed_days,
+            converted_local_to_utc,
+        ) = process_pdf_file_with_report(pdf, include_scheduled=args.include_scheduled)
         all_flights.extend(flights)
         total_skipped_deadheads += skipped_deadheads
         total_skipped_unflown += skipped_unflown
         processed_files.append(pdf)
 
         notes = []
+        if converted_local_to_utc:
+            notes.append("converted local times -> UTC")
         if skipped_deadheads:
             notes.append(f"skipped {skipped_deadheads} deadhead leg(s)")
         if skipped_unflown:
             notes.append(f"skipped {skipped_unflown} unflown scheduled leg(s)")
         note_str = f" ({', '.join(notes)})" if notes else ""
         print(f"  -> Extracted {len(flights)} flight record(s){note_str}.")
+        if collapsed_days:
+            day_summary = ", ".join(f"{d} ({hrs})" for d, hrs in collapsed_days)
+            print(
+                f"  ⚠️  WARNING: {len(collapsed_days)} flying day(s) in '{filename}' were collapsed when printed "
+                f"and have NO leg details in the PDF: {day_summary}. "
+                f"Click 'More -> Details' in Rainmaker and re-export to include them."
+            )
 
     if all_flights:
         df_new = pd.DataFrame(all_flights)

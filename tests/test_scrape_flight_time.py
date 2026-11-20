@@ -114,6 +114,54 @@ class TestRealRainmakerParsing(unittest.TestCase):
         year, month = sft.parse_month_year_from_tokens(token_lines)
         self.assertEqual((year, month), (2026, 11))
 
+    def test_local_times_converted_to_utc_across_timezones_and_midnight(self):
+        token_lines = [
+            _line("Period: 202610 - Oct 01/Oct 31 Search"),
+            _line("Show time as UTC"),
+            _line("23 S 12396\\RA E70,E75 04:04 -00:13 24:00 48.00"),
+            _line("LEG 4160 -1 E70 GSP ORD CA 11:38 12:54 11:52 13:08 Sched Sched 02:16 02:16 02:16"),
+            _line("30 S 13007\\CH E75 07:18 24:00 48.00"),
+            _line("CH 3367 -1 E75 CLT XNA CA 22:30 23:59 22:27 23:33 Sched Sched 02:29 02:06 02:29"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2026, month=10)
+        self.assertEqual(len(records), 2)
+        # GSP (EDT, UTC-4) 11:52 -> 15:52Z; ORD (CDT, UTC-5) 13:08 -> 18:08Z (diff = 02:16)
+        self.assertEqual(records[0]["Date"], "2026-10-23")
+        self.assertEqual(records[0]["Out"], "15:52")
+        self.assertEqual(records[0]["In"], "18:08")
+        self.assertEqual(records[0]["Total Time"], "02:16")
+        # CLT (EDT, UTC-4) Oct 30 22:27 -> Oct 31 02:27Z; XNA (CDT, UTC-5) 23:33 -> Oct 31 04:33Z (diff = 02:06)
+        self.assertEqual(records[1]["Date"], "2026-10-31")
+        self.assertEqual(records[1]["Out"], "02:27")
+        self.assertEqual(records[1]["In"], "04:33")
+        self.assertEqual(records[1]["Total Time"], "02:06")
+
+    def test_already_utc_pdf_is_not_double_converted(self):
+        token_lines = [
+            _line("Period: 202610 - Oct 01/Oct 31 Search"),
+            _line("Show time as Local"),
+            _line("23 S 12396\\RA E70,E75 04:04"),
+            _line("LEG 4160 -1 E70 GSP ORD CA 15:38 17:54 15:52 18:08 Sched Sched 02:16 02:16 02:16"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2026, month=10)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["Date"], "2026-10-23")
+        self.assertEqual(records[0]["Out"], "15:52")
+        self.assertEqual(records[0]["In"], "18:08")
+
+    def test_detects_collapsed_flying_days(self):
+        token_lines = [
+            _line("Period: 202608 - Aug 01/Aug 30 Search"),
+            _line("3 S 6639\\RF E70 05:38 22:35 45.17"),
+            _line("4 S 6500\\RF E75 03:39 05:13 10.43"),
+            _line("17 S 6625\\RF E75 01:31 09:15 18.50"),
+            _line("Details Flt Seq Eqp DHD DD ORG DST POS STD STA ATD ATA SkdFlt ActFlt SkdDur ActDur Time"),
+            _line("LEG 3635 -1 E75 MIA TLH CA 15:30 17:01 15:19 16:39 Sched Sched 01:31 01:20 01:31"),
+            _line("20 M 12105\\OT E75 0.00"),
+        ]
+        collapsed = sft.detect_collapsed_days(token_lines, year=2026, month=8)
+        self.assertEqual(collapsed, [("2026-08-03", "05:38"), ("2026-08-04", "03:39")])
+
     def test_operating_legs_preserved_alongside_skipped_deadhead(self):
         token_lines = [
             _line("16", "3501", "E75", "CA", "DFW", "AUS", "09:00", "10:00", "09:05", "10:02", "01:00", "00:57"),

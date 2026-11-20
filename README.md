@@ -10,6 +10,8 @@ Built to run inside your coding IDE or AI coding tool of choice (**Claude Code**
 
 - **Reads digital Rainmaker PDFs directly** (and falls back to multi-page macOS Vision OCR for scanned PDFs).
 - **Detects the month and year from the PDF itself** (`Period: YYYYMM` header, with filename fallback) and handles month-end rollovers cleanly.
+- **Auto-converts Local airport times to UTC (Zulu)** — even if **Show time as UTC** wasn't clicked in Rainmaker before printing, `Date`, `Out`, and `In` are converted to true UTC using airport IANA timezones so `(In − Out) == ActDur` in LogTen Pro.
+- **Warns if any flying day was left collapsed** when printed from Rainmaker so no legs ever go missing silently.
 - **Excludes deadheads from flight time** — legs marked `DHD-A\OA_DHD`, `DHD,OA_DHD`, `DHD`, `DHX`, or `D` are skipped so deadheads never inflate `Total Time`, `PIC`, or `SIC`.
 - **Logs actual block time (`ActDur`), not pay/credit time**, and skips future unflown scheduled legs that do not yet have actual `ATD`/`ATA` times.
 - **Deduplicates across runs** so you can drop in new monthly PDFs later without creating duplicate rows.
@@ -38,8 +40,8 @@ In your IDE's chat, tell your agent:
 
 Your agent will check Python 3, run `./setup.sh` (Mac/Linux) or `setup.bat` (Windows) to build the local virtual environment (`venv`), and verify the folders are ready.
 
-### Step 4: Drop Your PDFs & Run
-1. Export your monthly **Crew Pay Details** from Envoy Rainmaker as PDF (expand the days you want included before printing to PDF).
+### Step 4: Export From Rainmaker, Drop Your PDFs & Run
+1. In Envoy Rainmaker (**Crew Pay Details**), click **`More → Details`** so **all flying days are expanded** (collapsed days do not print individual legs into the PDF), and optionally click **`Show time as UTC`** (if left in Local time, the converter automatically converts `Date`/`Out`/`In` to UTC). Print / Save as PDF.
 2. Drop one or more PDFs into the **`new/`** folder.
 3. Tell your agent **`"go"`** (or **`"convert my PDFs"`**) — or run directly in the terminal:
    - **Mac / Linux:** `./run.sh`
