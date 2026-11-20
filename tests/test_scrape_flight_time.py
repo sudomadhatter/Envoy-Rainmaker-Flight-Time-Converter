@@ -238,5 +238,149 @@ class TestMonthDateTracker(unittest.TestCase):
         self.assertEqual(tracker.get_current_date_str(), "2025-01-01")
 
 
+class TestAdversarialStressCases(unittest.TestCase):
+    def test_diversion_and_return_to_gate_prefixes_do_not_corrupt_airports(self):
+        token_lines = [
+            _line("10 S 12001\\RA E75 03:00"),
+            _line("DIV 3480 -1 E75 MIA GNV CA 07:49 09:14 07:46 09:03 Sched Div 01:25 01:17 01:25"),
+            _line("RTD 3481 -1 E75 GNV MIA FO 10:00 11:20 10:05 10:25 Sched Rtd 01:20 00:20 01:20"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2025, month=6)
+        self.assertEqual(len(records), 2)
+        self.assertEqual((records[0]["From"], records[0]["To"]), ("MIA", "GNV"))
+        self.assertEqual((records[1]["From"], records[1]["To"]), ("GNV", "MIA"))
+        self.assertEqual((records[1]["PIC"], records[1]["SIC"]), ("", "00:20"))
+
+    def test_port_of_spain_pos_iata_code_is_not_dropped_as_header(self):
+        token_lines = [
+            _line("12 S 12005\\REGL E75 03:50"),
+            _line("LEG 3901 -1 E75 MIA POS CA 14:00 17:50 14:00 17:50 Sched Sched 03:50 03:50 03:50"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2025, month=7)
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]["From"], records[0]["To"]), ("MIA", "POS"))
+
+    def test_legacy_envoy_aircraft_codes_er4_e45_e170_and_fo_sic(self):
+        token_lines = [
+            _line("5 S 6100\\REGL E45 04:00"),
+            _line("LEG 3210 -1 ER4 DFW TYR FO 08:00 08:55 08:02 08:50 Sched Sched 00:55 00:48 00:55"),
+            _line("LEG 3211 -1 E45 TYR DFW FO 09:30 10:25 09:28 10:20 Sched Sched 00:55 00:52 00:55"),
+            _line("LEG 4012 -1 E170 ORD XNA FO 12:00 13:45 12:00 13:40 Sched Sched 01:45 01:40 01:45"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2022, month=3)
+        self.assertEqual([r["Aircraft Type"] for r in records], ["ER4", "E45", "E170"])
+        self.assertEqual([r["SIC"] for r in records], ["00:48", "00:52", "01:40"])
+        self.assertEqual([r["PIC"] for r in records], ["", "", ""])
+
+    def test_cancelled_leg_with_zero_actual_duration_is_skipped(self):
+        token_lines = [
+            _line("8 S 13001\\REGL E75 02:15"),
+            _line("CXL 3500 -1 E75 MIA CLT CA 10:0012:1510:0010:00 Cxl Cxl 02:15 00:00 02:15"),
+        ]
+        records, skipped_dhd, skipped_unflown = sft.parse_schedule_token_lines_with_stats(
+            token_lines, year=2025, month=5
+        )
+        self.assertEqual(records, [])
+        self.assertEqual(skipped_dhd, 0)
+        self.assertEqual(skipped_unflown, 1)
+
+    def test_two_digit_flight_number_with_four_digit_sequence(self):
+        token_lines = [
+            _line("19 S 6625\\REGL E75 01:10"),
+            _line("LEG 88 6625 E75 MIA EYW CA 11:00 12:10 11:00 12:05 Sched Sched 01:10 01:05 01:10"),
+        ]
+        records = sft.parse_schedule_token_lines(token_lines, year=2025, month=8)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["Flight"], "88")
+
+    def test_february_three_month_span_and_leap_year_feb_29(self):
+        # Non-leap year 2025: Jan 31 -> Feb 28 -> Mar 1
+        token_lines_2025 = [
+            _line("Period: 202502 - Jan 31/Mar 01"),
+            _line("31 S 7001\\REGL E75 01:30"),
+            _line("LEG 3101 -1 E75 MIA TLH CA 10:00 11:30 10:00 11:30 Sched Sched 01:30 01:30 01:30"),
+            _line("1 S 7001\\REGL E75 01:30"),
+            _line("LEG 3102 -1 E75 TLH MIA CA 13:00 14:30 13:00 14:30 Sched Sched 01:30 01:30 01:30"),
+            _line("28 S 7099\\REGL E75 01:30"),
+            _line("LEG 3103 -1 E75 MIA TLH CA 10:00 11:30 10:00 11:30 Sched Sched 01:30 01:30 01:30"),
+            _line("1 S 7099\\REGL E75 01:30"),
+            _line("LEG 3104 -1 E75 TLH MIA CA 13:00 14:30 13:00 14:30 Sched Sched 01:30 01:30 01:30"),
+        ]
+        recs_2025 = sft.parse_schedule_token_lines(token_lines_2025, year=2025, month=2)
+        self.assertEqual(
+            [r["Date"] for r in recs_2025],
+            ["2025-01-31", "2025-02-01", "2025-02-28", "2025-03-01"],
+        )
+
+        # Leap year 2024: Feb 28 -> Feb 29 -> Mar 1
+        token_lines_2024 = [
+            _line("Period: 202402 - Feb 01/Mar 01"),
+            _line("28 S 7050\\REGL E75 01:30"),
+            _line("LEG 3201 -1 E75 MIA TLH CA 10:00 11:30 10:00 11:30 Sched Sched 01:30 01:30 01:30"),
+            _line("29 S 7050\\REGL E75 01:30"),
+            _line("LEG 3202 -1 E75 TLH MIA CA 13:00 14:30 13:00 14:30 Sched Sched 01:30 01:30 01:30"),
+            _line("1 S 7050\\REGL E75 01:30"),
+            _line("LEG 3203 -1 E75 MIA TLH CA 16:00 17:30 16:00 17:30 Sched Sched 01:30 01:30 01:30"),
+        ]
+        recs_2024 = sft.parse_schedule_token_lines(token_lines_2024, year=2024, month=2)
+        self.assertEqual(
+            [r["Date"] for r in recs_2024],
+            ["2024-02-28", "2024-02-29", "2024-03-01"],
+        )
+
+    def test_westbound_arrive_before_depart_local_clock_and_dst_fallback_fold(self):
+        # 1) MIA 23:30 EST -> PNS 23:15 CST (45 min flight landing "15 min earlier" on local clock!)
+        # 2) DST fall-back night 2025-11-02: MIA 00:30 EDT (04:30Z) -> MIA 01:30 EST (fold=1, 06:30Z), ActDur=02:00
+        token_lines = [
+            _line("Show time as UTC"),
+            _line("15 S 8001\\REGL E75 00:45"),
+            _line("LEG 3700 -1 E75 MIA PNS CA 23:30 23:15 23:30 23:15 Sched Sched 00:45 00:45 00:45"),
+        ]
+        recs = sft.parse_schedule_token_lines(token_lines, year=2026, month=1)
+        self.assertEqual(recs[0]["Date"], "2026-01-16")
+        self.assertEqual((recs[0]["Out"], recs[0]["In"], recs[0]["Total Time"]), ("04:30", "05:15", "00:45"))
+
+        token_lines_dst = [
+            _line("Show time as UTC"),
+            _line("2 S 8002\\REGL E75 02:00"),
+            _line("LEG 3701 -1 E75 MIA JAX CA 00:30 01:30 00:30 01:30 Sched Sched 02:00 02:00 02:00"),
+        ]
+        recs_dst = sft.parse_schedule_token_lines(token_lines_dst, year=2025, month=11)
+        self.assertEqual((recs_dst[0]["Out"], recs_dst[0]["In"], recs_dst[0]["Total Time"]), ("04:30", "06:30", "02:00"))
+
+    def test_deduplicates_month_boundary_overlap_even_if_remarks_differ(self):
+        # Same physical flight exported once in Local PDF and once in UTC PDF across month rollover
+        local_lines = [
+            _line("Period: 202608 - Aug 01/Sep 01"),
+            _line("Show time as UTC"),
+            _line("30 S 9001\\REGL E75 01:20"),
+            _line("LEG 3635 -1 E75 MIA TLH CA 15:30 17:01 15:19 16:39 Sched Sched 01:31 01:20 01:31"),
+            _line("1 S 9001\\REGL E75 01:26"),
+            _line("LEG 3858 -1 E75 TLH MIA CA 06:05 07:31 05:57 07:23 Sched Sched 01:26 01:26 01:26"),
+        ]
+        utc_lines = [
+            _line("Period: 202609 - Sep 01/Sep 30"),
+            _line("Show time as Local"),
+            _line("1 S 9001\\REGL E75 01:26"),
+            _line("LEG 3858 -1 E75 TLH MIA CA 10:05 11:31 09:57 11:23 Sched Sched 01:26 01:26 01:26"),
+        ]
+        recs_a = sft.parse_schedule_token_lines(local_lines, year=2026, month=8)
+        recs_b = sft.parse_schedule_token_lines(utc_lines, year=2026, month=9)
+        combined = sft.combine_and_deduplicate_flights(recs_a + recs_b)
+        self.assertEqual(len(combined), 2)
+
+    def test_unknown_charter_airport_still_computes_exact_utc_from_known_hub(self):
+        # ZZZ is not in AIRPORT_TZ, but MIA is known (EST UTC-5 in Jan) + ActDur=02:10
+        token_lines = [
+            _line("Period: 202601 - Jan 01/Jan 30"),
+            _line("Show time as UTC"),
+            _line("10 S 9500\\CH E75 02:10"),
+            _line("CH 9100 -1 E75 MIA ZZZ CA 10:00 13:10 10:05 13:15 Sched Sched 02:10 02:10 02:10"),
+        ]
+        recs = sft.parse_schedule_token_lines(token_lines, year=2026, month=1)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual((recs[0]["Out"], recs[0]["In"], recs[0]["Total Time"]), ("15:05", "17:15", "02:10"))
+
+
 if __name__ == "__main__":
     unittest.main()

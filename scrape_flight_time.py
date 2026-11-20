@@ -49,9 +49,10 @@ class MonthDateTracker:
     - In-month: Day numbers belong to base month.
     - Overflow: Day resets from >= 25 to <= 7 near end of document (e.g. sequence crossing Nov 30 -> Dec 1).
     """
-    def __init__(self, base_year, base_month):
+    def __init__(self, base_year, base_month, allow_underflow=True):
         self.base_year = base_year
         self.base_month = base_month
+        self.allow_underflow = allow_underflow
         self.state = None  # "BEFORE", "IN", "AFTER"
         self.last_day = None
 
@@ -60,7 +61,7 @@ class MonthDateTracker:
             return
 
         if self.last_day is None:
-            if day >= 25:
+            if day >= 25 and self.allow_underflow:
                 self.state = "BEFORE"
             else:
                 self.state = "IN"
@@ -228,16 +229,51 @@ def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     return lines
 
 
+MONTH_ABBR = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_period_info_from_tokens(token_lines):
+    """
+    Extracts (year, month, allow_underflow) from Rainmaker PDF headers such as:
+    'Period: 202611 - Nov 01/Dec 01' or 'Period: 202502 - Jan 31/Mar 01' or 'Period:202608'.
+    When the period's explicit start month equals the base month, allow_underflow is False
+    so partial prints starting on day 25+ stay in the base month.
+    """
+    allow_underflow = True
+    found_ym = None
+    for line_tokens in token_lines[:40]:
+        line_str = " ".join(t['text'] for t in line_tokens)
+        m_full = re.search(
+            r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\s*-\s*([A-Za-z]{3})\s*\d{1,2}\s*/',
+            line_str,
+            re.IGNORECASE,
+        )
+        if m_full:
+            yr, mo = int(m_full.group(1)), int(m_full.group(2))
+            start_mo = MONTH_ABBR.get(m_full.group(3).lower())
+            if start_mo == mo:
+                allow_underflow = False
+            return yr, mo, allow_underflow
+        if found_ym is None:
+            m_short = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
+            if m_short:
+                found_ym = (int(m_short.group(1)), int(m_short.group(2)))
+    if found_ym is not None:
+        return found_ym[0], found_ym[1], True
+    return None
+
+
 def parse_month_year_from_tokens(token_lines):
     """
     Extracts (year, month) from Rainmaker PDF headers such as 'Period: 202611' or 'Period:202608'.
     Returns None if no Period header is present.
     """
-    for line_tokens in token_lines[:40]:
-        line_str = " ".join(t['text'] for t in line_tokens)
-        match = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+    info = parse_period_info_from_tokens(token_lines)
+    if info is not None:
+        return info[0], info[1]
     return None
 
 
@@ -369,14 +405,17 @@ def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, inclu
     records = []
     skipped_deadheads = 0
     skipped_unflown = 0
-    tracker = MonthDateTracker(year, month)
+    period_info = parse_period_info_from_tokens(token_lines)
+    allow_underflow = period_info[2] if period_info is not None else True
+    tracker = MonthDateTracker(year, month, allow_underflow=allow_underflow)
 
     non_airports = {
         'LEG', 'DHX', 'DHD', 'DD', 'SI', 'RF', 'R1', 'R2', 'TRNG', 'POS', 'STD', 'STA',
         'ATD', 'ATA', 'EQP', 'FLT', 'SEQ', 'DUTY', 'E75', 'E70', 'E145', 'E175', 'ORG',
         'DST', 'DHO', 'PREM', 'PAID', 'RPT', 'BASE', 'UNPAID', 'SCHED', 'ACTFLT',
         'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL', 'USD', 'PDM', 'SRC',
-        'UTC', 'RSV', 'ADD', 'PAY', 'RESV', 'REGL'
+        'UTC', 'RSV', 'ADD', 'PAY', 'RESV', 'REGL', 'DIV', 'RTD', 'CXL', 'CNX', 'ERJ',
+        'CRJ', 'EMB', 'IOE'
     }
 
     for line_tokens in token_lines:
@@ -402,25 +441,38 @@ def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, inclu
                 if 1 <= day_val <= 31:
                     tracker.update_day(day_val)
 
-        flt_match = re.search(r'\b(\d{3,4})\b', line_str)
+        # Prefer structured Rainmaker '<DetailCode> <FlightNum 1..4d> <Seq>' before generic 3..4d fallback
+        flt_struct_match = re.match(r'^[A-Z]{2,4}\s+(\d{1,4})\s+-?\d+\b', line_str)
+        flt_match = flt_struct_match or re.search(r'\b(\d{3,4})\b', line_str)
         if flt_match and tracker.last_day is not None and is_deadhead_line(line_str):
             skipped_deadheads += 1
             continue
 
-        # Look for operating flight legs
-        three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
-        airports = [w for w in three_letter_words if w not in non_airports]
-
-        if len(airports) >= 2 and flt_match and tracker.last_day is not None:
-            flt_num = flt_match.group(1)
-            org = airports[0]
-            dst = airports[1]
-
-            eqp_match = re.search(r'\b(E75|E175|E145|E70|CRJ\d|B73\d|A32\d)\b', line_str)
-            eqp = eqp_match.group(1) if eqp_match else "E75"
-
-            pos_match = re.search(r'\b(FO|CA|CP)\b', line_str)
+        # Prefer structural '<ORG> <DST> <POS>' columns so 3-letter detail prefixes (DIV, RTD, CXL)
+        # or IATA codes like POS (Port of Spain) never corrupt airport extraction
+        org_dst_pos_match = re.search(r'\b([A-Z]{3})\s+([A-Z]{3})\s+(CA|FO|CP|FB)\b', line_str)
+        if org_dst_pos_match:
+            org = org_dst_pos_match.group(1)
+            dst = org_dst_pos_match.group(2)
+            pos = org_dst_pos_match.group(3).upper()
+            has_airports = org not in {"ORG", "FLT", "SEQ", "EQP"} and dst not in {"DST", "FLT", "SEQ"}
+        else:
+            three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
+            airports = [w for w in three_letter_words if w not in non_airports]
+            has_airports = len(airports) >= 2
+            org = airports[0] if has_airports else ""
+            dst = airports[1] if has_airports else ""
+            pos_match = re.search(r'\b(FO|CA|CP|FB)\b', line_str)
             pos = pos_match.group(1).upper() if pos_match else "FO"
+
+        if has_airports and flt_match and tracker.last_day is not None:
+            flt_num = flt_match.group(1)
+
+            eqp_match = re.search(
+                r'\b(E175|E170|E145|E140|E135|E75|E70|E45|E40|E35|ER4|ERD|CRJ\d?|CR7|CR9|CR2|B73\d?|A319|A320|A321|A32\d)\b',
+                line_str,
+            )
+            eqp = eqp_match.group(1) if eqp_match else "E75"
 
             # No \b required so concatenated Rainmaker times like 07:4909:1407:4609:03 extract cleanly
             times = re.findall(r'(\d{2}:\d{2})', line_str)
@@ -437,6 +489,9 @@ def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, inclu
                 atd = times[2]
                 ata = times[3]
                 act_dur = times[5]
+                if act_dur == "00:00" and not include_scheduled:
+                    skipped_unflown += 1
+                    continue
 
             date_str = tracker.get_current_date_str()
 
@@ -519,6 +574,35 @@ def process_pdf_file(pdf_path, include_scheduled=False):
     return records
 
 
+COLUMNS_ORDER = [
+    "Date", "Flight", "Aircraft Type", "Registration", "From", "To",
+    "Out", "In", "Total Time", "PIC", "SIC", "Deadhead", "Remarks",
+]
+DEDUP_SUBSET = ["Date", "Flight", "From", "To", "Out", "In"]
+
+
+def combine_and_deduplicate_flights(flights, existing_df=None):
+    """
+    Combine flight dictionaries (and optional existing CSV DataFrame), deduplicate on the
+    natural flight key (Date, Flight, From, To, Out, In) so month-boundary overlaps across
+    adjacent PDFs never double-count, and sort chronologically.
+    """
+    df_new = pd.DataFrame(flights)
+    for col in COLUMNS_ORDER:
+        if col not in df_new.columns:
+            df_new[col] = ""
+    df_new = df_new[COLUMNS_ORDER]
+
+    if existing_df is not None and not existing_df.empty:
+        for col in COLUMNS_ORDER:
+            if col not in existing_df.columns:
+                existing_df[col] = ""
+        df_combined = pd.concat([existing_df[COLUMNS_ORDER], df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+
+    df_combined = df_combined.drop_duplicates(subset=DEDUP_SUBSET, keep="first")
+    return df_combined.sort_values(by=["Date", "Out", "Flight"], kind="stable").reset_index(drop=True)
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     default_input = os.path.join(base_dir, "new")
@@ -583,27 +667,14 @@ def main():
             )
 
     if all_flights:
-        df_new = pd.DataFrame(all_flights)
-        columns_order = [
-            "Date", "Flight", "Aircraft Type", "Registration", "From", "To",
-            "Out", "In", "Total Time", "PIC", "SIC", "Deadhead", "Remarks"
-        ]
-        for col in columns_order:
-            if col not in df_new.columns:
-                df_new[col] = ""
-
-        df_new = df_new[columns_order]
-
+        existing_df = None
         if os.path.exists(args.output):
             try:
-                df_existing = pd.read_csv(args.output, dtype=str)
-                df_combined = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates()
+                existing_df = pd.read_csv(args.output, dtype=str).fillna("")
             except Exception:
-                df_combined = df_new
-        else:
-            df_combined = df_new
+                existing_df = None
 
-        df_combined = df_combined.sort_values(by=["Date", "Out", "Flight"], kind="stable")
+        df_combined = combine_and_deduplicate_flights(all_flights, existing_df=existing_df)
         df_combined.to_csv(args.output, index=False)
 
         summary_notes = []

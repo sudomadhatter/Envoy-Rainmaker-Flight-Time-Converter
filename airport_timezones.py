@@ -129,18 +129,34 @@ def convert_leg_local_to_utc(date_str, org, dst, atd, ata, act_dur):
     dur_mins = hhmm_to_minutes(act_dur)
 
     if org_tz_name and dst_tz_name:
-        dep_local = datetime.strptime(f"{date_str} {atd}", "%Y-%m-%d %H:%M").replace(
-            tzinfo=ZoneInfo(org_tz_name)
-        )
-        arr_local = datetime.strptime(f"{date_str} {ata}", "%Y-%m-%d %H:%M").replace(
-            tzinfo=ZoneInfo(dst_tz_name)
-        )
-        dep_utc = dep_local.astimezone(UTC)
-        arr_utc = arr_local.astimezone(UTC)
-        while arr_utc < dep_utc:
-            arr_local += timedelta(days=1)
-            arr_utc = arr_local.astimezone(UTC)
-        return dep_utc.strftime("%Y-%m-%d"), dep_utc.strftime("%H:%M"), arr_utc.strftime("%H:%M")
+        org_tz = ZoneInfo(org_tz_name)
+        dst_tz = ZoneInfo(dst_tz_name)
+        base_dep_naive = datetime.strptime(f"{date_str} {atd}", "%Y-%m-%d %H:%M")
+        base_arr_naive = datetime.strptime(f"{date_str} {ata}", "%Y-%m-%d %H:%M")
+
+        fallback_result = None
+        for dep_fold in (0, 1):
+            for arr_fold in (0, 1):
+                dep_local = base_dep_naive.replace(tzinfo=org_tz, fold=dep_fold)
+                arr_local = base_arr_naive.replace(tzinfo=dst_tz, fold=arr_fold)
+                dep_utc = dep_local.astimezone(UTC)
+                arr_utc = arr_local.astimezone(UTC)
+                while arr_utc < dep_utc:
+                    arr_local = (arr_local.replace(tzinfo=None) + timedelta(days=1)).replace(
+                        tzinfo=dst_tz, fold=arr_fold
+                    )
+                    arr_utc = arr_local.astimezone(UTC)
+                candidate = (
+                    dep_utc.strftime("%Y-%m-%d"),
+                    dep_utc.strftime("%H:%M"),
+                    arr_utc.strftime("%H:%M"),
+                )
+                if fallback_result is None:
+                    fallback_result = candidate
+                calc_mins = int((arr_utc - dep_utc).total_seconds() // 60)
+                if calc_mins == dur_mins:
+                    return candidate
+        return fallback_result
 
     if org_tz_name:
         dep_local = datetime.strptime(f"{date_str} {atd}", "%Y-%m-%d %H:%M").replace(
