@@ -28,7 +28,7 @@ If you have never used a coding LLM or Git before, you can run this entire conve
 
 > **"Clone https://github.com/sudomadhatter/Envoy-Rainmaker-Flight-Time-Converter.git into my Documents folder, set it up using AGENTS.md, and show me the `new` folder where I drop my Rainmaker PDFs."**
 
-4. In Envoy Rainmaker (**Crew Pay Details**), click **`More → Details`** so all flying days are expanded, print/save as PDF, drop your PDFs into that **`new/`** folder, and type **`"go"`** in Claude.
+4. In Envoy Rainmaker (**Crew Pay Details**), select your Period and click **`Search`**, click **`More → Details`** so all flying days are expanded, print/save as PDF, drop your PDFs into that **`new/`** folder, and type **`"go"`** in Claude.
 5. Open **LogTen Pro** (`File → Import from File → Flights...`) and select **`logten pro format/logten_pro_import.csv`**.
 
 ---
@@ -56,7 +56,7 @@ In your IDE's chat, tell your agent:
 Your agent will check Python 3, run `./setup.sh` (Mac/Linux) or `setup.bat` (Windows) to build the local virtual environment (`venv`), and verify the folders are ready.
 
 ### Step 4: Export From Rainmaker, Drop Your PDFs & Run
-1. In Envoy Rainmaker (**Crew Pay Details**), click **`More → Details`** so **all flying days are expanded** (collapsed days do not print individual legs into the PDF), and optionally click **`Show time as UTC`** (if left in Local time, the converter automatically converts `Date`/`Out`/`In` to UTC). Print / Save as PDF.
+1. In Envoy Rainmaker (**Crew Pay Details**), select your Period and click **`Search`**, then click **`More → Details`** so **all flying days are expanded** (collapsed days do not print individual legs into the PDF), and optionally click **`Show time as UTC`** (if left in Local time, the converter automatically converts `Date`/`Out`/`In` to UTC). Print / Save as PDF.
 2. Drop one or more PDFs into the **`new/`** folder.
 3. Tell your agent **`"go"`** (or **`"convert my PDFs"`**) — or run directly in the terminal:
    - **Mac / Linux:** `./run.sh`
