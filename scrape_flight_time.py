@@ -9,17 +9,20 @@ Supports both digital PDFs and scanned/image-based PDFs via macOS Vision OCR.
 
 import os
 import re
-import glob
 import sys
 import shutil
+import logging
 import calendar
 import argparse
 import tempfile
 import pandas as pd
 
+from airport_timezones import convert_leg_local_to_utc, hhmm_to_minutes
+
 # PDF text layer libraries
 try:
     import pdfplumber
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
 except ImportError:
     pdfplumber = None
 
@@ -46,9 +49,10 @@ class MonthDateTracker:
     - In-month: Day numbers belong to base month.
     - Overflow: Day resets from >= 25 to <= 7 near end of document (e.g. sequence crossing Nov 30 -> Dec 1).
     """
-    def __init__(self, base_year, base_month):
+    def __init__(self, base_year, base_month, allow_underflow=True):
         self.base_year = base_year
         self.base_month = base_month
+        self.allow_underflow = allow_underflow
         self.state = None  # "BEFORE", "IN", "AFTER"
         self.last_day = None
 
@@ -57,7 +61,7 @@ class MonthDateTracker:
             return
 
         if self.last_day is None:
-            if day >= 25:
+            if day >= 25 and self.allow_underflow:
                 self.state = "BEFORE"
             else:
                 self.state = "IN"
@@ -125,6 +129,43 @@ def parse_month_year_from_filename(filename):
     return 2025, 1
 
 
+DEADHEAD_PATTERN = re.compile(
+    r'(?:'
+    r'DHD[-_/\\\s]*A[-_/\\\s]*OA[-_]?DHD'
+    r'|OA[-_]?DHD'
+    r'|DHD[-_/\\]?A\b'
+    r'|\bDHD\b'
+    r'|\bDHX\b'
+    r'|(?<=\s)D(?=\s)'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def is_deadhead_line(line_str):
+    """Return True if a schedule line represents a deadhead leg (not flight time)."""
+    return bool(DEADHEAD_PATTERN.search(f" {line_str} "))
+
+
+def find_pdf_files(input_path):
+    """Return sorted, deduplicated PDF paths from a single file or directory."""
+    if os.path.isfile(input_path):
+        return [input_path]
+    if not os.path.isdir(input_path):
+        return []
+
+    seen = set()
+    pdf_files = []
+    for entry in sorted(os.listdir(input_path)):
+        if entry.lower().endswith(".pdf"):
+            full_path = os.path.join(input_path, entry)
+            norm = os.path.normcase(os.path.abspath(full_path))
+            if os.path.isfile(full_path) and norm not in seen:
+                seen.add(norm)
+                pdf_files.append(full_path)
+    return pdf_files
+
+
 def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     """
     Renders PDF page to image, runs macOS Vision OCR, and returns lines composed of spatial token objects.
@@ -136,31 +177,33 @@ def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     pdf = pypdfium2.PdfDocument(pdf_path)
     page = pdf[page_idx]
     image = page.render(scale=3).to_pil()
-    
-    temp_img_path = os.path.join(tempfile.gettempdir(), f"ocr_page_{page_idx}.png")
-    image.save(temp_img_path)
 
-    file_url = NSURL.fileURLWithPath_(temp_img_path)
-    request_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(file_url, None)
+    tmp_fd, temp_img_path = tempfile.mkstemp(prefix=f"ocr_page_{page_idx}_", suffix=".png")
+    os.close(tmp_fd)
+    try:
+        image.save(temp_img_path)
 
-    request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    request_handler.performRequests_error_([request], None)
+        file_url = NSURL.fileURLWithPath_(temp_img_path)
+        request_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(file_url, None)
 
-    obs_list = []
-    for obs in request.results():
-        bbox = obs.boundingBox()
-        text = obs.topCandidates_(1)[0].string()
-        obs_list.append({
-            'text': text,
-            'x': bbox.origin.x,
-            'y': 1.0 - bbox.origin.y,  # Convert to top-down Y
-            'w': bbox.size.width,
-            'h': bbox.size.height
-        })
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        request_handler.performRequests_error_([request], None)
 
-    if os.path.exists(temp_img_path):
-        os.remove(temp_img_path)
+        obs_list = []
+        for obs in (request.results() or []):
+            bbox = obs.boundingBox()
+            text = obs.topCandidates_(1)[0].string()
+            obs_list.append({
+                'text': text,
+                'x': bbox.origin.x,
+                'y': 1.0 - bbox.origin.y,  # Convert to top-down Y
+                'w': bbox.size.width,
+                'h': bbox.size.height
+            })
+    finally:
+        if os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
 
     obs_list.sort(key=lambda i: i['y'])
 
@@ -186,37 +229,193 @@ def run_vision_ocr_token_lines(pdf_path, page_idx=0):
     return lines
 
 
-def extract_pdf_token_lines(pdf_path):
+MONTH_ABBR = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_period_info_from_tokens(token_lines):
     """
-    Extracts text tokens with spatial coordinates. Falls back to pdfplumber lines if Vision OCR unavailable.
+    Extracts (year, month, allow_underflow) from Rainmaker PDF headers such as:
+    'Period: 202611 - Nov 01/Dec 01' or 'Period: 202502 - Jan 31/Mar 01' or 'Period:202608'.
+    When the period's explicit start month equals the base month, allow_underflow is False
+    so partial prints starting on day 25+ stay in the base month.
     """
-    if HAS_VISION_OCR:
-        return run_vision_ocr_token_lines(pdf_path)
-    
-    # Fallback to pdfplumber text line strings wrapped as mock token lists
+    allow_underflow = True
+    found_ym = None
+    for line_tokens in token_lines[:40]:
+        line_str = " ".join(t['text'] for t in line_tokens)
+        m_full = re.search(
+            r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\s*-\s*([A-Za-z]{3})\s*\d{1,2}\s*/',
+            line_str,
+            re.IGNORECASE,
+        )
+        if m_full:
+            yr, mo = int(m_full.group(1)), int(m_full.group(2))
+            start_mo = MONTH_ABBR.get(m_full.group(3).lower())
+            if start_mo == mo:
+                allow_underflow = False
+            return yr, mo, allow_underflow
+        if found_ym is None:
+            m_short = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
+            if m_short:
+                found_ym = (int(m_short.group(1)), int(m_short.group(2)))
+    if found_ym is not None:
+        return found_ym[0], found_ym[1], True
+    return None
+
+
+def parse_month_year_from_tokens(token_lines):
+    """
+    Extracts (year, month) from Rainmaker PDF headers such as 'Period: 202611' or 'Period:202608'.
+    Returns None if no Period header is present.
+    """
+    info = parse_period_info_from_tokens(token_lines)
+    if info is not None:
+        return info[0], info[1]
+    return None
+
+
+def extract_pdfplumber_token_lines(pdf_path):
+    """Extract text lines via pdfplumber for digital PDFs."""
     token_lines = []
-    if pdfplumber:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text() or ""
-                for line in extracted.splitlines():
-                    if line.strip():
-                        token_lines.append([{'text': line.strip(), 'x': 0.05, 'y': 0.5}])
+    if not pdfplumber:
+        return token_lines
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_text() or ""
+            for line in extracted.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    token_lines.append([{'text': stripped, 'x': 0.05, 'y': 0.5}])
     return token_lines
 
 
-def parse_schedule_token_lines(token_lines, year=2025, month=1):
+def extract_pdf_token_lines(pdf_path):
     """
-    Parses spatial token lines into flight leg dictionaries with month trapping.
+    Extracts text lines across all pages.
+    Uses pdfplumber first for digital PDFs, falling back to multi-page macOS Vision OCR
+    when no embedded text layer is present (scanned/image PDFs).
+    """
+    token_lines = extract_pdfplumber_token_lines(pdf_path)
+    if token_lines:
+        return token_lines
+
+    if HAS_VISION_OCR and pypdfium2:
+        pdf = pypdfium2.PdfDocument(pdf_path)
+        all_lines = []
+        for page_idx in range(len(pdf)):
+            all_lines.extend(run_vision_ocr_token_lines(pdf_path, page_idx=page_idx))
+        return all_lines
+
+    return []
+
+
+def detect_collapsed_days(token_lines, year=2025, month=1):
+    """
+    Detect flying day summary rows (e.g. '3 S 6639\\RF E70 05:38 ...') whose leg detail
+    sub-table was left collapsed when the Rainmaker page was printed to PDF.
+    Returns a list of (date_str, base_hhmm) tuples.
+    """
+    tracker = MonthDateTracker(year, month)
+    collapsed = []
+    pending_day = None  # (date_str, base_hhmm, has_details)
+
+    for line_tokens in token_lines:
+        if not line_tokens:
+            continue
+        line_str = " ".join(t['text'] for t in line_tokens)
+
+        if (
+            re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}\b', line_str)
+            or line_str.startswith(("http://", "https://"))
+            or "Rainmaker - CrewPayDetails" in line_str
+        ):
+            continue
+
+        if "Details" in line_str and "Flt" in line_str and "Seq" in line_str:
+            if pending_day is not None:
+                pending_day = (pending_day[0], pending_day[1], True)
+            continue
+
+        first_token = line_tokens[0]
+        if first_token['x'] < 0.16:
+            m_day = re.match(r'^(?P<day>[0-3]?\d)(?!\s*[:/\.\-])(?:\s|$)', first_token['text'])
+            if m_day:
+                day_val = int(m_day.group("day"))
+                if 1 <= day_val <= 31:
+                    if pending_day is not None and not pending_day[2]:
+                        collapsed.append((pending_day[0], pending_day[1]))
+                    pending_day = None
+
+                    tracker.update_day(day_val)
+                    date_str = tracker.get_current_date_str()
+                    has_seq = bool(re.search(r'\b\d{3,6}\\[A-Za-z]+', line_str))
+                    pos_times = re.findall(r'(?<!-)(\b\d{2}:\d{2}\b)', line_str)
+                    nonzero_times = [t for t in pos_times if t != "00:00"]
+                    if has_seq and nonzero_times:
+                        pending_day = (date_str, nonzero_times[0], False)
+
+    if pending_day is not None and not pending_day[2]:
+        collapsed.append((pending_day[0], pending_day[1]))
+
+    return collapsed
+
+
+def detect_pdf_uses_local_time(token_lines, raw_records):
+    """
+    Determine whether the PDF's Out/In times are in airport local time rather than UTC.
+    1. In Rainmaker, when local time is displayed, the toggle button reads 'Show time as UTC'.
+       When UTC is displayed, the toggle button reads 'Show time as Local'.
+    2. If neither header is present, inspect any cross-timezone legs: if converting local->UTC
+       makes (In - Out) match ActDur where raw (In - Out) did not, the PDF is in local time.
+    """
+    for line_tokens in token_lines[:60]:
+        line_str = " ".join(t['text'] for t in line_tokens).lower()
+        if "show time as local" in line_str or "show local time" in line_str:
+            return False
+        if "show time as utc" in line_str:
+            return True
+
+    for rec in raw_records:
+        raw_diff = (hhmm_to_minutes(rec["In"]) - hhmm_to_minutes(rec["Out"])) % 1440
+        act_mins = hhmm_to_minutes(rec["Total Time"])
+        if raw_diff != act_mins:
+            _, utc_out, utc_in = convert_leg_local_to_utc(
+                rec["Date"], rec["From"], rec["To"], rec["Out"], rec["In"], rec["Total Time"]
+            )
+            utc_diff = (hhmm_to_minutes(utc_in) - hhmm_to_minutes(utc_out)) % 1440
+            if utc_diff == act_mins:
+                return True
+
+    return False
+
+
+def parse_schedule_token_lines_with_stats(token_lines, year=2025, month=1, include_scheduled=False):
+    """
+    Parses spatial token lines into operating flight leg dictionaries with month trapping.
+    Deadhead legs (e.g. DHD-A\\OA_DHD, DHD,OA_DHD, DHD, DHX, standalone D) are excluded
+    from flight time. Future unflown scheduled legs (missing ATD/ATA/ActDur) are skipped
+    unless include_scheduled=True. Automatically converts local airport Out/In/Date to UTC
+    when Rainmaker was exported without 'Show time as UTC' toggled.
+    Returns (records, skipped_deadheads, skipped_unflown).
     """
     records = []
-    tracker = MonthDateTracker(year, month)
+    skipped_deadheads = 0
+    skipped_unflown = 0
+    period_info = parse_period_info_from_tokens(token_lines)
+    allow_underflow = period_info[2] if period_info is not None else True
+    tracker = MonthDateTracker(year, month, allow_underflow=allow_underflow)
 
     non_airports = {
         'LEG', 'DHX', 'DHD', 'DD', 'SI', 'RF', 'R1', 'R2', 'TRNG', 'POS', 'STD', 'STA',
         'ATD', 'ATA', 'EQP', 'FLT', 'SEQ', 'DUTY', 'E75', 'E70', 'E145', 'E175', 'ORG',
         'DST', 'DHO', 'PREM', 'PAID', 'RPT', 'BASE', 'UNPAID', 'SCHED', 'ACTFLT',
-        'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL'
+        'SKDFLT', 'SKDDUR', 'ACTDUR', 'TIME', 'DETAILS', 'TOTAL', 'USD', 'PDM', 'SRC',
+        'UTC', 'RSV', 'ADD', 'PAY', 'RESV', 'REGL', 'DIV', 'RTD', 'CXL', 'CNX', 'ERJ',
+        'CRJ', 'EMB', 'IOE'
     }
 
     for line_tokens in token_lines:
@@ -225,61 +424,79 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1):
 
         line_str = " ".join([t['text'] for t in line_tokens])
 
-        # Day tracking: check if first token on far left (x < 0.16) is a day number 1..31
+        # Skip browser print headers and footer URLs so timestamps like 11/19/26 never corrupt day tracking
+        if (
+            re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}\b', line_str)
+            or line_str.startswith(("http://", "https://"))
+            or "Rainmaker - CrewPayDetails" in line_str
+        ):
+            continue
+
+        # Day tracking: check if first token on far left (x < 0.16) starts with a standalone day number 1..31
         first_token = line_tokens[0]
         if first_token['x'] < 0.16:
-            m_day = re.match(r'^(?P<day>[0-3]?\d)\b(?!\s*:)', first_token['text'])
+            m_day = re.match(r'^(?P<day>[0-3]?\d)(?!\s*[:/\.\-])(?:\s|$)', first_token['text'])
             if m_day:
                 day_val = int(m_day.group("day"))
                 if 1 <= day_val <= 31:
                     tracker.update_day(day_val)
 
-        # Look for flight legs
-        three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
-        airports = [w for w in three_letter_words if w not in non_airports]
-        flt_match = re.search(r'\b(\d{3,4})\b', line_str)
+        # Prefer structured Rainmaker '<DetailCode> <FlightNum 1..4d> <Seq>' before generic 3..4d fallback
+        flt_struct_match = re.match(r'^[A-Z]{2,4}\s+(\d{1,4})\s+-?\d+\b', line_str)
+        flt_match = flt_struct_match or re.search(r'\b(\d{3,4})\b', line_str)
+        if flt_match and tracker.last_day is not None and is_deadhead_line(line_str):
+            skipped_deadheads += 1
+            continue
 
-        if len(airports) >= 2 and flt_match and tracker.last_day is not None:
-            flt_num = flt_match.group(1)
-            org = airports[0]
-            dst = airports[1]
-
-            eqp_match = re.search(r'\b(E75|E175|E145|E70|CRJ\d|B73\d|A32\d)\b', line_str)
-            eqp = eqp_match.group(1) if eqp_match else "E75"
-
-            pos_match = re.search(r'\b(FO|CA|CP)\b', line_str)
+        # Prefer structural '<ORG> <DST> <POS>' columns so 3-letter detail prefixes (DIV, RTD, CXL)
+        # or IATA codes like POS (Port of Spain) never corrupt airport extraction
+        org_dst_pos_match = re.search(r'\b([A-Z]{3})\s+([A-Z]{3})\s+(CA|FO|CP|FB)\b', line_str)
+        if org_dst_pos_match:
+            org = org_dst_pos_match.group(1)
+            dst = org_dst_pos_match.group(2)
+            pos = org_dst_pos_match.group(3).upper()
+            has_airports = org not in {"ORG", "FLT", "SEQ", "EQP"} and dst not in {"DST", "FLT", "SEQ"}
+        else:
+            three_letter_words = re.findall(r'\b([A-Z]{3})\b', line_str)
+            airports = [w for w in three_letter_words if w not in non_airports]
+            has_airports = len(airports) >= 2
+            org = airports[0] if has_airports else ""
+            dst = airports[1] if has_airports else ""
+            pos_match = re.search(r'\b(FO|CA|CP|FB)\b', line_str)
             pos = pos_match.group(1).upper() if pos_match else "FO"
 
-            times = re.findall(r'\b(\d{2}:\d{2})\b', line_str)
-            std = times[0] if len(times) > 0 else ""
-            sta = times[1] if len(times) > 1 else ""
-            atd = times[2] if len(times) > 2 else std
-            ata = times[3] if len(times) > 3 else sta
+        if has_airports and flt_match and tracker.last_day is not None:
+            flt_num = flt_match.group(1)
 
-            act_dur = ""
-            if len(times) >= 6:
-                act_dur = times[5]
-            elif len(times) >= 5:
-                act_dur = times[4]
-            elif len(times) >= 1:
-                act_dur = times[-1]
+            eqp_match = re.search(
+                r'\b(E175|E170|E145|E140|E135|E75|E70|E45|E40|E35|ER4|ERD|CRJ\d?|CR7|CR9|CR2|B73\d?|A319|A320|A321|A32\d)\b',
+                line_str,
+            )
+            eqp = eqp_match.group(1) if eqp_match else "E75"
+
+            # No \b required so concatenated Rainmaker times like 07:4909:1407:4609:03 extract cleanly
+            times = re.findall(r'(\d{2}:\d{2})', line_str)
+            if len(times) < 6:
+                if not include_scheduled:
+                    skipped_unflown += 1
+                    continue
+                std = times[0] if len(times) > 0 else ""
+                sta = times[1] if len(times) > 1 else ""
+                atd = std
+                ata = sta
+                act_dur = times[2] if len(times) > 2 else "00:00"
             else:
-                act_dur = "00:00"
-
-            is_deadhead = (" D " in f" {line_str} " or "DHD" in line_str or "DHX" in line_str) and "TRNG" not in line_str
+                atd = times[2]
+                ata = times[3]
+                act_dur = times[5]
+                if act_dur == "00:00" and not include_scheduled:
+                    skipped_unflown += 1
+                    continue
 
             date_str = tracker.get_current_date_str()
 
-            pic_time = ""
-            sic_time = ""
-            dhd_time = ""
-
-            if is_deadhead:
-                dhd_time = act_dur
-            elif pos in ("CA", "CP"):
-                pic_time = act_dur
-            else:
-                sic_time = act_dur
+            pic_time = act_dur if pos in ("CA", "CP") else ""
+            sic_time = "" if pos in ("CA", "CP") else act_dur
 
             record = {
                 "Date": date_str,
@@ -290,23 +507,102 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1):
                 "To": dst,
                 "Out": atd,
                 "In": ata,
-                "Total Time": act_dur if not is_deadhead else "00:00",
+                "Total Time": act_dur,
                 "PIC": pic_time,
                 "SIC": sic_time,
-                "Deadhead": dhd_time,
-                "Remarks": f"Position: {pos}, Out: {atd}Z, In: {ata}Z"
+                "Deadhead": "",
+                "Remarks": f"Position: {pos}, Out: {atd}Z, In: {ata}Z",
+                "_pos": pos,
             }
             records.append(record)
 
+    uses_local = detect_pdf_uses_local_time(token_lines, records)
+    for rec in records:
+        pos = rec.pop("_pos")
+        if uses_local and rec["Out"] and rec["In"] and rec["Total Time"]:
+            local_date = rec["Date"]
+            local_out = rec["Out"]
+            local_in = rec["In"]
+            utc_date, utc_out, utc_in = convert_leg_local_to_utc(
+                local_date, rec["From"], rec["To"], local_out, local_in, rec["Total Time"]
+            )
+            rec["Date"] = utc_date
+            rec["Out"] = utc_out
+            rec["In"] = utc_in
+            rec["Remarks"] = (
+                f"Position: {pos}, Local: {local_date} {local_out}-{local_in}, "
+                f"Out: {utc_out}Z, In: {utc_in}Z"
+            )
+
+    return records, skipped_deadheads, skipped_unflown
+
+
+def parse_schedule_token_lines(token_lines, year=2025, month=1, include_scheduled=False):
+    """
+    Parses spatial token lines into operating flight leg dictionaries with month trapping.
+    """
+    records, _, _ = parse_schedule_token_lines_with_stats(
+        token_lines, year=year, month=month, include_scheduled=include_scheduled
+    )
     return records
 
 
-def process_pdf_file(pdf_path):
-    year, month = parse_month_year_from_filename(pdf_path)
+def process_pdf_file_with_report(pdf_path, include_scheduled=False):
     token_lines = extract_pdf_token_lines(pdf_path)
-    return parse_schedule_token_lines(token_lines, year=year, month=month)
+    header_ym = parse_month_year_from_tokens(token_lines)
+    if header_ym is not None:
+        year, month = header_ym
+    else:
+        year, month = parse_month_year_from_filename(pdf_path)
+    collapsed_days = detect_collapsed_days(token_lines, year=year, month=month)
+    records, skipped_deadheads, skipped_unflown = parse_schedule_token_lines_with_stats(
+        token_lines, year=year, month=month, include_scheduled=include_scheduled
+    )
+    converted_local_to_utc = any("Local:" in r.get("Remarks", "") for r in records)
+    return records, skipped_deadheads, skipped_unflown, collapsed_days, converted_local_to_utc
 
 
+def process_pdf_file_with_stats(pdf_path, include_scheduled=False):
+    records, skipped_deadheads, skipped_unflown, _, _ = process_pdf_file_with_report(
+        pdf_path, include_scheduled=include_scheduled
+    )
+    return records, skipped_deadheads, skipped_unflown
+
+
+def process_pdf_file(pdf_path, include_scheduled=False):
+    records, _, _ = process_pdf_file_with_stats(pdf_path, include_scheduled=include_scheduled)
+    return records
+
+
+COLUMNS_ORDER = [
+    "Date", "Flight", "Aircraft Type", "Registration", "From", "To",
+    "Out", "In", "Total Time", "PIC", "SIC", "Deadhead", "Remarks",
+]
+DEDUP_SUBSET = ["Date", "Flight", "From", "To", "Out", "In"]
+
+
+def combine_and_deduplicate_flights(flights, existing_df=None):
+    """
+    Combine flight dictionaries (and optional existing CSV DataFrame), deduplicate on the
+    natural flight key (Date, Flight, From, To, Out, In) so month-boundary overlaps across
+    adjacent PDFs never double-count, and sort chronologically.
+    """
+    df_new = pd.DataFrame(flights)
+    for col in COLUMNS_ORDER:
+        if col not in df_new.columns:
+            df_new[col] = ""
+    df_new = df_new[COLUMNS_ORDER]
+
+    if existing_df is not None and not existing_df.empty:
+        for col in COLUMNS_ORDER:
+            if col not in existing_df.columns:
+                existing_df[col] = ""
+        df_combined = pd.concat([existing_df[COLUMNS_ORDER], df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+
+    df_combined = df_combined.drop_duplicates(subset=DEDUP_SUBSET, keep="first")
+    return df_combined.sort_values(by=["Date", "Out", "Flight"], kind="stable").reset_index(drop=True)
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     default_input = os.path.join(base_dir, "new")
@@ -316,15 +612,12 @@ def main():
     parser = argparse.ArgumentParser(description="Scrape pilot flight time PDFs into LogTen Pro CSV format.")
     parser.add_argument("--input", "-i", default=default_input, help="Directory containing PDF files or path to single PDF.")
     parser.add_argument("--output", "-o", default=default_output, help="Output CSV file path.")
-    parser.add_argument("--archive", "-a", default=default_archive, help="Directory to move processed PDFs to.")
+    parser.add_argument("--archive", "-a", default=default_archive, help="Directory to move processed PDFs to (empty string to keep originals in place).")
+    parser.add_argument("--include-scheduled", action="store_true", help="Include future scheduled legs that do not yet have actual block times.")
 
     args = parser.parse_args()
 
-    pdf_files = []
-    if os.path.isfile(args.input):
-        pdf_files = [args.input]
-    elif os.path.isdir(args.input):
-        pdf_files = glob.glob(os.path.join(args.input, "*.pdf")) + glob.glob(os.path.join(args.input, "*.PDF"))
+    pdf_files = find_pdf_files(args.input)
 
     if not pdf_files:
         print(f"No PDF files found in '{args.input}'.")
@@ -332,44 +625,65 @@ def main():
 
     print(f"Found {len(pdf_files)} PDF file(s) to process in '{args.input}'.")
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     if args.archive:
         os.makedirs(args.archive, exist_ok=True)
 
     all_flights = []
+    total_skipped_deadheads = 0
+    total_skipped_unflown = 0
     processed_files = []
 
-    for pdf in sorted(pdf_files):
+    for pdf in pdf_files:
         filename = os.path.basename(pdf)
         print(f"Processing '{filename}'...")
-        flights = process_pdf_file(pdf)
+        (
+            flights,
+            skipped_deadheads,
+            skipped_unflown,
+            collapsed_days,
+            converted_local_to_utc,
+        ) = process_pdf_file_with_report(pdf, include_scheduled=args.include_scheduled)
         all_flights.extend(flights)
+        total_skipped_deadheads += skipped_deadheads
+        total_skipped_unflown += skipped_unflown
         processed_files.append(pdf)
-        print(f"  -> Extracted {len(flights)} flight record(s).")
+
+        notes = []
+        if converted_local_to_utc:
+            notes.append("converted local times -> UTC")
+        if skipped_deadheads:
+            notes.append(f"skipped {skipped_deadheads} deadhead leg(s)")
+        if skipped_unflown:
+            notes.append(f"skipped {skipped_unflown} unflown scheduled leg(s)")
+        note_str = f" ({', '.join(notes)})" if notes else ""
+        print(f"  -> Extracted {len(flights)} flight record(s){note_str}.")
+        if collapsed_days:
+            day_summary = ", ".join(f"{d} ({hrs})" for d, hrs in collapsed_days)
+            print(
+                f"  ⚠️  WARNING: {len(collapsed_days)} flying day(s) in '{filename}' were collapsed when printed "
+                f"and have NO leg details in the PDF: {day_summary}. "
+                f"Click 'More -> Details' in Rainmaker and re-export to include them."
+            )
 
     if all_flights:
-        df_new = pd.DataFrame(all_flights)
-        columns_order = [
-            "Date", "Flight", "Aircraft Type", "Registration", "From", "To",
-            "Out", "In", "Total Time", "PIC", "SIC", "Deadhead", "Remarks"
-        ]
-        for col in columns_order:
-            if col not in df_new.columns:
-                df_new[col] = ""
-
-        df_new = df_new[columns_order]
-
+        existing_df = None
         if os.path.exists(args.output):
             try:
-                df_existing = pd.read_csv(args.output, dtype=str)
-                df_combined = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates()
+                existing_df = pd.read_csv(args.output, dtype=str).fillna("")
             except Exception:
-                df_combined = df_new
-        else:
-            df_combined = df_new
+                existing_df = None
 
+        df_combined = combine_and_deduplicate_flights(all_flights, existing_df=existing_df)
         df_combined.to_csv(args.output, index=False)
-        print(f"\nSuccessfully updated '{args.output}' (Total records: {len(df_combined)}).")
+
+        summary_notes = []
+        if total_skipped_deadheads:
+            summary_notes.append(f"skipped {total_skipped_deadheads} deadhead leg(s)")
+        if total_skipped_unflown:
+            summary_notes.append(f"skipped {total_skipped_unflown} unflown scheduled leg(s)")
+        summary_suffix = f", {', '.join(summary_notes)}" if summary_notes else ""
+        print(f"\nSuccessfully updated '{args.output}' (Total records: {len(df_combined)}{summary_suffix}).")
 
         if args.archive:
             for pdf in processed_files:

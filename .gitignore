@@ -9,17 +9,23 @@ __pycache__/
 *$py.class
 *.so
 
-# Input, output & personal PDF/CSV storage directories
-new/
+# Input, output & personal PDF/CSV storage directories (keep empty folders via .gitkeep)
 new/*
-scraped/
+!new/.gitkeep
 scraped/*
+!scraped/.gitkeep
 scraped_stored/
 scraped_stored/*
-logten pro format/
 logten pro format/*
+!logten pro format/.gitkeep
+times/
+converted_times/
 scratch/
 scratch/*
+
+# Local agent worktrees & session artifacts
+.claude/
+_artifacts/
 
 # OS metadata
 .DS_Store
