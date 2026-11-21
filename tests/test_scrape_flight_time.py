@@ -381,6 +381,18 @@ class TestAdversarialStressCases(unittest.TestCase):
         self.assertEqual(len(recs), 1)
         self.assertEqual((recs[0]["Out"], recs[0]["In"], recs[0]["Total Time"]), ("15:05", "17:15", "02:10"))
 
+    def test_unsubmitted_period_dropdown_uses_actual_report_body_and_warns(self):
+        token_lines = [
+            _line("Period: 202508 - Aug 01/Aug 30 Search"),
+            _line("Position:CA"),
+            _line("Period:202611"),
+        ]
+        self.assertEqual(sft.parse_month_year_from_tokens(token_lines), (2026, 11))
+        self.assertEqual(
+            sft.detect_unsubmitted_period_dropdown(token_lines),
+            ((2025, 8), (2026, 11)),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

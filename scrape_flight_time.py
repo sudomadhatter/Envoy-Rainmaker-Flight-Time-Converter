@@ -237,13 +237,15 @@ MONTH_ABBR = {
 
 def parse_period_info_from_tokens(token_lines):
     """
-    Extracts (year, month, allow_underflow) from Rainmaker PDF headers such as:
-    'Period: 202611 - Nov 01/Dec 01' or 'Period: 202502 - Jan 31/Mar 01' or 'Period:202608'.
-    When the period's explicit start month equals the base month, allow_underflow is False
-    so partial prints starting on day 25+ stay in the base month.
+    Extracts (year, month, allow_underflow) from Rainmaker PDF headers.
+    Important: Rainmaker has BOTH a top filter dropdown ('Period: 202508 - Aug 01/Aug 30 Search')
+    AND the actual loaded report header ('Period:202611' under 'Position:CA'). If a user changes
+    the dropdown without clicking 'Search' before printing, the body 'Period:YYYYMM' is the true
+    report inside the PDF and always wins over the unsubmitted dropdown.
     """
-    allow_underflow = True
-    found_ym = None
+    dropdown_info = None  # (yr, mo, allow_underflow)
+    body_ym = None        # (yr, mo)
+
     for line_tokens in token_lines[:40]:
         line_str = " ".join(t['text'] for t in line_tokens)
         m_full = re.search(
@@ -251,18 +253,60 @@ def parse_period_info_from_tokens(token_lines):
             line_str,
             re.IGNORECASE,
         )
-        if m_full:
+        if m_full and dropdown_info is None:
             yr, mo = int(m_full.group(1)), int(m_full.group(2))
             start_mo = MONTH_ABBR.get(m_full.group(3).lower())
-            if start_mo == mo:
-                allow_underflow = False
-            return yr, mo, allow_underflow
-        if found_ym is None:
-            m_short = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
-            if m_short:
-                found_ym = (int(m_short.group(1)), int(m_short.group(2)))
-    if found_ym is not None:
-        return found_ym[0], found_ym[1], True
+            dropdown_info = (yr, mo, start_mo != mo)
+            continue
+
+        m_body = re.search(r'^Period:\s*(20\d{2})(0[1-9]|1[0-2])\s*$', line_str, re.IGNORECASE)
+        if m_body and body_ym is None:
+            body_ym = (int(m_body.group(1)), int(m_body.group(2)))
+
+    if body_ym is not None and dropdown_info is not None:
+        if body_ym != (dropdown_info[0], dropdown_info[1]):
+            # Dropdown was not submitted ('Search' not clicked); trust the loaded report body
+            return body_ym[0], body_ym[1], True
+        return dropdown_info
+
+    if dropdown_info is not None:
+        return dropdown_info
+
+    if body_ym is not None:
+        return body_ym[0], body_ym[1], True
+
+    # Fallback: any inline Period: YYYYMM
+    for line_tokens in token_lines[:40]:
+        line_str = " ".join(t['text'] for t in line_tokens)
+        m_any = re.search(r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\b', line_str, re.IGNORECASE)
+        if m_any:
+            return int(m_any.group(1)), int(m_any.group(2)), True
+    return None
+
+
+def detect_unsubmitted_period_dropdown(token_lines):
+    """
+    Return ((dropdown_yr, dropdown_mo), (body_yr, body_mo)) if the PDF's top filter dropdown
+    disagrees with the actual loaded report Period (meaning 'Search' wasn't clicked before printing),
+    otherwise None.
+    """
+    dropdown_ym = None
+    body_ym = None
+    for line_tokens in token_lines[:40]:
+        line_str = " ".join(t['text'] for t in line_tokens)
+        m_full = re.search(
+            r'Period:\s*(20\d{2})(0[1-9]|1[0-2])\s*-\s*[A-Za-z]{3}\s*\d{1,2}\s*/',
+            line_str,
+            re.IGNORECASE,
+        )
+        if m_full and dropdown_ym is None:
+            dropdown_ym = (int(m_full.group(1)), int(m_full.group(2)))
+            continue
+        m_body = re.search(r'^Period:\s*(20\d{2})(0[1-9]|1[0-2])\s*$', line_str, re.IGNORECASE)
+        if m_body and body_ym is None:
+            body_ym = (int(m_body.group(1)), int(m_body.group(2)))
+    if dropdown_ym and body_ym and dropdown_ym != body_ym:
+        return dropdown_ym, body_ym
     return None
 
 
@@ -352,10 +396,19 @@ def detect_collapsed_days(token_lines, year=2025, month=1):
 
                     tracker.update_day(day_val)
                     date_str = tracker.get_current_date_str()
-                    has_seq = bool(re.search(r'\b\d{3,6}\\[A-Za-z]+', line_str))
+                    has_seq = bool(re.search(r'\b\d{3,6}\\[A-Za-z0-9]+', line_str)) and not bool(
+                        re.search(r'\\AddR\b', line_str)
+                    )
+                    has_eqp = bool(
+                        re.search(
+                            r'\b(E175|E170|E145|E140|E135|E75|E70|E45|E40|E35|ER4|ERD|CRJ\d?|CR7|CR9|CR2|B73\d?|A319|A320|A321|A32\d)\b',
+                            line_str,
+                        )
+                    )
+                    has_zero_usd = bool(re.search(r'\b0\.00\b', line_str))
                     pos_times = re.findall(r'(?<!-)(\b\d{2}:\d{2}\b)', line_str)
-                    nonzero_times = [t for t in pos_times if t != "00:00"]
-                    if has_seq and nonzero_times:
+                    nonzero_times = [t for t in pos_times if t not in ("00:00", "24:00")]
+                    if has_seq and has_eqp and nonzero_times and not has_zero_usd:
                         pending_day = (date_str, nonzero_times[0], False)
 
     if pending_day is not None and not pending_day[2]:
@@ -549,6 +602,7 @@ def parse_schedule_token_lines(token_lines, year=2025, month=1, include_schedule
 
 def process_pdf_file_with_report(pdf_path, include_scheduled=False):
     token_lines = extract_pdf_token_lines(pdf_path)
+    dropdown_mismatch = detect_unsubmitted_period_dropdown(token_lines)
     header_ym = parse_month_year_from_tokens(token_lines)
     if header_ym is not None:
         year, month = header_ym
@@ -559,11 +613,18 @@ def process_pdf_file_with_report(pdf_path, include_scheduled=False):
         token_lines, year=year, month=month, include_scheduled=include_scheduled
     )
     converted_local_to_utc = any("Local:" in r.get("Remarks", "") for r in records)
-    return records, skipped_deadheads, skipped_unflown, collapsed_days, converted_local_to_utc
+    return (
+        records,
+        skipped_deadheads,
+        skipped_unflown,
+        collapsed_days,
+        converted_local_to_utc,
+        dropdown_mismatch,
+    )
 
 
 def process_pdf_file_with_stats(pdf_path, include_scheduled=False):
-    records, skipped_deadheads, skipped_unflown, _, _ = process_pdf_file_with_report(
+    records, skipped_deadheads, skipped_unflown, _, _, _ = process_pdf_file_with_report(
         pdf_path, include_scheduled=include_scheduled
     )
     return records, skipped_deadheads, skipped_unflown
@@ -643,6 +704,7 @@ def main():
             skipped_unflown,
             collapsed_days,
             converted_local_to_utc,
+            dropdown_mismatch,
         ) = process_pdf_file_with_report(pdf, include_scheduled=args.include_scheduled)
         all_flights.extend(flights)
         total_skipped_deadheads += skipped_deadheads
@@ -658,6 +720,13 @@ def main():
             notes.append(f"skipped {skipped_unflown} unflown scheduled leg(s)")
         note_str = f" ({', '.join(notes)})" if notes else ""
         print(f"  -> Extracted {len(flights)} flight record(s){note_str}.")
+        if dropdown_mismatch:
+            (dy, dm), (by, bm) = dropdown_mismatch
+            print(
+                f"  ⚠️  WARNING: '{filename}' has filter dropdown {dy:04d}-{dm:02d}, "
+                f"but 'Search' was not clicked before printing — the PDF actually contains "
+                f"Period {by:04d}-{bm:02d}! Re-export {dy:04d}-{dm:02d} after clicking 'Search'."
+            )
         if collapsed_days:
             day_summary = ", ".join(f"{d} ({hrs})" for d, hrs in collapsed_days)
             print(
